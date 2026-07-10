@@ -33,8 +33,8 @@ import urllib.request
 
 from collections import defaultdict
 from inspect import cleandoc
+from packaging.version import parse as parse_version
 from pathlib import Path, PurePath
-from pkg_resources import parse_version
 from textwrap import dedent
 
 DEFAULT_CONFIG = """startup=0
