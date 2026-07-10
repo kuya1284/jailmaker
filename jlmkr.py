@@ -32,11 +32,16 @@ import urllib.request
 from collections import defaultdict
 from inspect import cleandoc
 from pathlib import Path, PurePath
+from pkg_resources import parse_version
 from textwrap import dedent
 
 DEFAULT_CONFIG = """startup=0
 gpu_passthrough_intel=0
 gpu_passthrough_nvidia=0
+
+# Force Proprietary NVIDIA drivers to be installed on TrueNAS CE Goldeye or newer
+force_nvidia_legacy_driver=0
+
 # Turning off seccomp filtering improves performance at the expense of security
 seccomp=1
 
@@ -61,7 +66,7 @@ pre_start_hook=
 #     echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables
 
 # Specify command/script to run on the HOST after starting the jail
-# For example to attach to multiple bridge interfaces 
+# For example to attach to multiple bridge interfaces
 # when using --network-veth-extra=ve-myjail-1:veth1
 post_start_hook=
 # post_start_hook=#!/usr/bin/bash
@@ -115,17 +120,18 @@ systemd_nspawn_default_args=--bind-ro=/sys/module
 # Always add --bind-ro=/sys/module to make lsmod happy
 # https://manpages.debian.org/bookworm/manpages/sysfs.5.en.html
 
-DOWNLOAD_SCRIPT_DIGEST = (
-    "645ba65a8846a2f402fc8bd870029b95fbcd3128e3046cd55642d577652cb0a0"
-)
+DOWNLOAD_SCRIPT_DIGEST = ('645ba65a8846a2f402fc8bd870029b95fbcd3128e3046cd55642d577652cb0a0')
+MULTIARCH_ROOT_PATH = '/usr/lib/x86_64-linux-gnu'
+SYSEXT_PATH = '/usr/share/truenas/sysext-extensions'
 SCRIPT_PATH = os.path.realpath(__file__)
 SCRIPT_NAME = os.path.basename(SCRIPT_PATH)
 SCRIPT_DIR_PATH = os.path.dirname(SCRIPT_PATH)
 COMMAND_NAME = os.path.basename(__file__)
-JAILS_DIR_PATH = os.path.join(SCRIPT_DIR_PATH, "jails")
-JAIL_CONFIG_NAME = "config"
-JAIL_ROOTFS_NAME = "rootfs"
-SHORTNAME = "jlmkr"
+JAILS_DIR_PATH = os.path.join(SCRIPT_DIR_PATH, 'jails')
+JAIL_CONFIG_NAME = 'config'
+JAIL_ROOTFS_NAME = 'rootfs'
+SHORTNAME = 'jlmkr'
+VERSION_GOLDEYE = '25.10'
 
 # Only set a color if we have an interactive tty
 if sys.stdout.isatty():
@@ -315,6 +321,12 @@ def fail(*args, **kwargs):
     sys.exit(1)
 
 
+def nvidia_fail(error_msg):
+    extra_msg = 'disable "gpu_passthrough_nvidia" and "force_nvidia_legacy_driver" if the problem persists'
+
+    fail(f'{RED}ERROR: {error_msg}; {extra_msg}.{NORMAL}')
+
+
 def get_jail_path(jail_name):
     return os.path.join(JAILS_DIR_PATH, jail_name)
 
@@ -327,148 +339,498 @@ def get_jail_rootfs_path(jail_name):
     return os.path.join(get_jail_path(jail_name), JAIL_ROOTFS_NAME)
 
 
+# Is the NVIDIA Open Kernel driver installed?
+def is_nvidia_open_driver_installed():
+    driver_version_file = Path('/proc/driver/nvidia/version')
+
+    if not driver_version_file.exists():
+        nvidia_fail('NVIDIA driver missing')
+
+    return 'Open Kernel' in driver_version_file.read_text()
+
+
+# Runs the NVIDIA System Management Interface program, and optionally returns
+# STDOUT when needed
+#
+# @link https://docs.nvidia.com/deploy/nvidia-smi/index.html
+def run_nvidia_smi_command(nvidia_smi_args, is_output=False):
+    smi = subprocess.run(['nvidia-smi'] + nvidia_smi_args, check=True, capture_output=is_output)
+
+    if not is_output:
+        return smi
+
+    return smi.stdout.decode().strip()
+
+
+# Loads the NVIDIA Unified Virtual Memory kernel module, which will
+# automatically load all other modules that are needed
+def install_nvidia_modules():
+    try:
+        nvidia_uvm = 'nvidia-current-uvm'
+        subprocess.run(['modinfo', nvidia_uvm], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        try:
+            nvidia_uvm = 'nvidia-uvm'
+            subprocess.run(['modinfo', nvidia_uvm], check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            nvidia_fail(f'Failed to identify NVIDIA Unified Virtual Memory module: {e}')
+
+    try:
+        subprocess.run(['modprobe', nvidia_uvm], check=True)
+    except subprocess.CalledProcessError as e:
+        nvidia_fail(f'Failed to load NVIDIA Unified Virtual Memory module: {e}')
+
+
+# Uninstalls all NVIDIA kernel modules
+def uninstall_nvidia_modules():
+    try:
+        nvidia_uvm = 'nvidia-current-uvm'
+        subprocess.run(['modinfo', nvidia_uvm], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        try:
+            nvidia_uvm = 'nvidia-uvm'
+            subprocess.run(['modinfo', nvidia_uvm], check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            nvidia_fail(f'Failed to identify NVIDIA Unified Virtual Memory module: {e}')
+
+    # Persistence mode MUST be disabled in order to remove the "nvidia-modeset"
+    # module while ignoring errors
+    subprocess.run(['pkill', '-f', 'nvidia-persistenced'], stderr=subprocess.DEVNULL)
+    time.sleep(1)
+
+    try:
+        subprocess.run(f'modprobe -r {nvidia_uvm} nvidia-drm nvidia-modeset nvidia', check=True, shell=True)
+    except subprocess.CalledProcessError as e:
+        nvidia_fail(f'Failed to remove one or more NVIDIA kernel modules: {e}')
+
+
+# Runs "nvidia-smi" to test the NVIDIA driver, which needs to run successfully,
+# otherwise "nvidia-container-cli list" will fail as well
+def test_nvidia_driver():
+    try:
+        run_nvidia_smi_command(['-f', '/dev/null'])
+    except subprocess.CalledProcessError as e:
+        nvidia_fail(f'Failed to test NVIDIA driver using nvidia-smi: {e}')
+
+
+# Does the NVIDIA Proprietary driver need to be installed? The NVIDIA Open
+# Kernel driver is only applicable to Turing models and newer. This is
+# determined by checking if the GPU's Compute Capability is 7.5 or higher.
+# Anything less than this value will require the Open Kernel driver to be
+# replaced with the Proprietary driver on TrueNAS CE Goldeye (25.10) and newer.
+#
+# @link https://developer.nvidia.com/blog/nvidia-releases-open-source-gpu-kernel-modules/#which_gpus_are_supported_by_open_gpu_kernel_modules
+# @link https://github.com/NVIDIA/open-gpu-kernel-modules?tab=readme-ov-file#compatible-gpus
+# @link https://docs.nvidia.com/cuda/archive/12.6.2/cuda-c-programming-guide/index.html#compute-capability
+# @link https://developer.nvidia.com/cuda/gpus
+# @link https://leimao.github.io/blog/NVIDIA-GPU-Compute-Capability
+def is_nvidia_proprietary_driver_required():
+    # TrueNAS CE versions below Goldeye already include the Proprietary driver
+    if parse_version(get_truenas_version()) < parse_version(VERSION_GOLDEYE):
+        return False
+
+    # Was the Open Kernel driver already replaced?
+    if not is_nvidia_open_driver_installed():
+        return False
+
+    nvidia_smi_args = ['--query-gpu=compute_cap', '--format=csv,noheader']
+
+    try:
+        compute_capability = run_nvidia_smi_command(nvidia_smi_args, True)
+    except subprocess.CalledProcessError as e:
+        nvidia_fail(f'Failed to determine NVIDIA Compute Capability: {e}')
+
+    return float(compute_capability) < 7.5
+
+
+# Returns the TrueNAS SemVer version that's currently installed
+def get_truenas_version():
+    os_version = Path('/etc/version')
+
+    if not os_version.exists():
+        nvidia_fail(f'Failed to determine TrueNAS version: {e}')
+
+    os_version = os_version.read_text()
+
+    if not os_version:
+        nvidia_fail('Failed to determine TrueNAS version')
+
+    return os_version
+
+
+# Deletes old NVIDIA Open Kernel driver backup(s) whenever TrueNAS gets upgraded
+# because the Proprietary driver will get replaced with the latest Open Kernel
+# driver
+def delete_old_nvidia_open_driver_backups():
+    sysext_dir = Path(SYSEXT_PATH)
+
+    for back_up_file in list(sysext_dir.glob('nvidia-open-truenas*.raw')):
+        back_up_file = str(back_up_file)
+        extension_version = re.search(r'nvidia-open-truenas-([\d.]+).raw', back_up_file)
+        extension_version = extension_version.group(1) if extension_version else None
+
+        if extension_version and parse_version(extension_version) == parse_version(get_truenas_version()):
+            continue
+
+        os.remove(back_up_file)
+
+
+# Downloads the NVIDIA Proprietary driver when applicable
+#
+# @link https://www.reddit.com/r/truenas/comments/1rn9hom/running_a_legacy_nvidia_gpu_gtx_1070_on_truenas
+# @link https://github.com/zzzhouuu/truenas-nvidia-drivers
+# @link https://truenas-drivers.zhouyou.info/index.html
+def download_nvidia_proprietary_driver():
+    os_version = get_truenas_version()
+    base_driver_url = 'https://truenas-drivers.zhouyou.info'
+    proprietary_driver_url = f'{base_driver_url}/{os_version}/nvidia.raw'
+    proprietary_driver_checksum_url = f'{base_driver_url}/{os_version}/nvidia.raw.sha256'
+    driver_file = '/tmp/nvidia.raw'
+    checksum_file = '/tmp/nvidia.raw.sha256'
+
+    try:
+        subprocess.run(['wget', '-q', proprietary_driver_url, '-O', driver_file], check=True)
+    except subprocess.CalledProcessError:
+        nvidia_fail('Failed to download the NVIDIA Proprietary driver system extension')
+
+    try:
+        subprocess.run(['wget', '-q', proprietary_driver_checksum_url, '-O', checksum_file], check=True)
+    except subprocess.CalledProcessError:
+        nvidia_fail('Failed to download the NVIDIA Proprietary driver checksum')
+
+    # Verify the hash to ensure that the driver was downloaded successfully
+    expected_checksum = Path(checksum_file).read_text().strip()
+    os.remove(checksum_file)
+
+    if not validate_sha256(driver_file, expected_checksum):
+        nvidia_fail('NVIDIA Proprietary driver is corrupt and must be downloaded again')
+
+    return driver_file
+
+
+# Enables or disables the "Install NVIDIA Drivers" configuration setting
+def toggle_nvidia_drivers_setting(is_enable):
+    # Just continue if the driver is already installed
+    if is_enable and shutil.which('nvidia-smi'):
+        return
+
+    true_or_false = 'true' if is_enable else 'false'
+    json = f'{{ "nvidia": {true_or_false} }}'
+    midclt = f"midclt call docker.update '{json}'"
+
+    try:
+        subprocess.run(midclt, check=True, shell=True, stdout=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        enable_or_disable = 'enable' if is_enable else 'disable'
+        nvidia_fail(f'Failed to {enable_or_disable} NVIDIA driver: {e}')
+
+    # Wait for the change to take effect
+    time.sleep(1)
+
+
+# Toggles the TrueNAS system extensions filesystem to be editable or read-only
+def toggle_editable_sysext_filesystem(is_editable):
+    readonly = 'off' if is_editable else 'on'
+
+    try:
+        zfs_list = subprocess.run('zfs list -H -o name /usr', check=True, shell=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        nvidia_fail(f'Failed to get sysext filesystem: {e}')
+
+    sysext_path = zfs_list.stdout.decode().strip()
+
+    try:
+        subprocess.run(['zfs', 'set', f'readonly={readonly}', sysext_path], check=True)
+    except subprocess.CalledProcessError as e:
+        action = 'editable' if is_editable else 'read-only'
+        nvidia_fail(f'Failed to make sysext filesystem {action}: {e}')
+
+
+# Returns the path to the NVIDIA Proprietary driver file as a Path object
+def get_nvidia_proprietary_driver_file():
+    return Path(f'{SYSEXT_PATH}/nvidia.raw')
+
+
+# Returns the path to the NVIDIA Open Kernel driver backup file as a Path object
+def get_nvidia_open_driver_backup_file():
+    os_version = get_truenas_version()
+
+    return Path(f'{SYSEXT_PATH}/nvidia-open-truenas-{os_version}.raw')
+
+
+# Replaces the NVIDIA Open Kernel driver with the Proprietary driver when the
+# GPU's compute capability is below 7.5, otherwise a check will be made to
+# determine if the Proprietary driver needs to be upgraded due to TrueNAS being
+# upgraded for versions 25.10 and higher.
+#
+# @link https://www.reddit.com/r/truenas/comments/1rn9hom/running_a_legacy_nvidia_gpu_gtx_1070_on_truenas
+# @link https://github.com/zzzhouuu/truenas-nvidia-drivers
+# @link https://truenas-drivers.zhouyou.info/index.html
+def install_nvidia_proprietary_driver():
+    # Was the Open Kernel driver already replaced?
+    if not is_nvidia_open_driver_installed():
+        return
+
+    # Delete old backups to clear up space before proceeding with installing the
+    # latest Proprietary driver
+    delete_old_nvidia_open_driver_backups()
+
+    driver_file = download_nvidia_proprietary_driver()
+
+    # Temporarily disable the "Install NVIDIA Drivers" configuration setting and
+    # uninstall the Open Kernel modules/driver
+    uninstall_nvidia_modules()
+    toggle_nvidia_drivers_setting(False)
+    toggle_editable_sysext_filesystem(True)
+
+    is_installed = False
+    installed_driver_file = get_nvidia_proprietary_driver_file()
+    backup_driver_file = get_nvidia_open_driver_backup_file()
+
+    try:
+        # Backup the existing driver, but only if the backup doesn't already
+        # exist to prevent the original from getting clobbered
+        if installed_driver_file.is_file() and not backup_driver_file.is_file():
+            shutil.move(installed_driver_file, backup_driver_file)
+
+        # Move the NVIDIA Proprietary driver while the system extensions
+        # filesystem is editable
+        is_installed = shutil.move(driver_file, installed_driver_file)
+    except FileNotFoundError:
+        nvidia_fail('Downloaded NVIDIA Proprietary driver does not exist')
+    except (PermissionError, OSError, shutil.Error) as e:
+        nvidia_fail(f'Failed to move the NVIDIA Proprietary driver: {e}')
+    except Exception as e:
+        nvidia_fail(f'Unexpected error while attempting to move the NVIDIA Proprietary driver: {e}')
+    finally:
+        # Restore the existing driver on failure; otherwise delete it since the
+        # driver could always be reinstalled manually
+        if not is_installed and backup_driver_file.is_file():
+            shutil.move(backup_driver_file, installed_driver_file)
+
+    # Re-enable the "Install NVIDIA Drivers" configuration setting to
+    # automatically merge the system extensions, then install the modules
+    toggle_editable_sysext_filesystem(False)
+    toggle_nvidia_drivers_setting(True)
+    install_nvidia_modules()
+
+    # If all has gone according to plan, the Open Kernel driver should no longer
+    # be installed; if it is, then something went wrong
+    if is_nvidia_open_driver_installed():
+        nvidia_fail('Failed to install the NVIDIA Proprietary driver')
+
+    # Make sure "nvidia-smi" still works with the Proprietary driver
+    test_nvidia_driver()
+
+
+# Enables NVIDIA Persistence mode to avoid repetitive GPU initialization, which
+# will also ensure that the NVIDIA Modeset module get created and initialized so
+# that it can be bind mounted to the jail
+def enable_nvidia_persistence_mode():
+    try:
+        subprocess.run(['nvidia-persistenced'], check=True, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError as e:
+        # Was persistence mode previously enabled?
+        nvidia_smi_args = ['--query-gpu=persistence_mode', '--format=csv,noheader']
+
+        try:
+            persistence_mode = run_nvidia_smi_command(nvidia_smi_args, True)
+        except subprocess.CalledProcessError as e:
+            nvidia_fail(f'Failed to determine NVIDIA Persistence Mode status: {e}')
+
+        if 'Enabled' not in persistence_mode:
+            nvidia_fail(f'Failed to initialize "NVIDIA Persistence Mode": {e}')
+
+
+# Returns all the NVIDIA GPU dependencies that may need to be bind mounted to
+# the jail
+def get_nvidia_driver_dependency_list(is_libraries=False):
+    nvidia_container_cli = ['nvidia-container-cli', 'list']
+
+    if is_libraries:
+        nvidia_container_cli.append('--libraries')
+
+    try:
+        dependencies = subprocess.run(nvidia_container_cli, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        nvidia_fail(f'Failed to identify NVIDIA driver files: {e}')
+
+    return dependencies.stdout.decode().split("\n")
+
+
 # Test intel GPU by decoding mp4 file (output is discarded)
 # Run the commands below in the jail:
 # curl -o bunny.mp4 https://www.w3schools.com/html/mov_bbb.mp4
 # ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -i bunny.mp4 -f null - && echo 'SUCCESS!'
 
 
-def passthrough_intel(gpu_passthrough_intel, systemd_nspawn_additional_args):
-    if not gpu_passthrough_intel:
+def passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_additional_args):
+    if not is_gpu_passthrough_intel:
         return
 
-    if not os.path.exists("/dev/dri"):
-        eprint(
-            dedent(
-                """
-        No intel GPU seems to be present...
-        Skip passthrough of intel GPU."""
-            )
-        )
+    if not os.path.exists('/dev/dri'):
+        eprint(dedent(
+            """
+            No intel GPU seems to be present...
+            Skip passthrough of intel GPU.
+            """
+        ))
+
         return
 
-    systemd_nspawn_additional_args.append("--bind=/dev/dri")
+    systemd_nspawn_additional_args.append('--bind=/dev/dri')
 
 
 def passthrough_nvidia(
-    gpu_passthrough_nvidia, systemd_nspawn_additional_args, jail_name
+    is_gpu_passthrough_nvidia,
+    is_force_nvidia_legacy_driver,
+    systemd_nspawn_additional_args,
+    jail_name
 ):
     jail_rootfs_path = get_jail_rootfs_path(jail_name)
-    ld_so_conf_path = Path(
-        os.path.join(jail_rootfs_path), f"etc/ld.so.conf.d/{SHORTNAME}-nvidia.conf"
-    )
+    ld_config_file = Path(os.path.join(jail_rootfs_path), f'etc/ld.so.conf.d/{SHORTNAME}-nvidia.conf')
 
-    if not gpu_passthrough_nvidia:
-        # Cleanup the config file we made when passthrough was enabled
-        ld_so_conf_path.unlink(missing_ok=True)
+    # The "force_nvidia_legacy_driver" setting must only be used for TrueNAS CE
+    # Goldeye or newer
+    if parse_version(get_truenas_version()) < parse_version(VERSION_GOLDEYE):
+        is_force_nvidia_legacy_driver = False
+
+    # Should the config file be deleted, if it was created when passthrough was
+    # previously enabled?
+    if not is_gpu_passthrough_nvidia:
+        print('Deleting the dynamic libraries config file')
+        ld_config_file.unlink(missing_ok=True)
+
+    # Should the the original NVIDIA Open Kernel driver be restored, if a backup
+    # of the driver exists?
+    if not (is_force_nvidia_legacy_driver or is_nvidia_proprietary_driver_required()):
+        backup_driver_file = get_nvidia_open_driver_backup_file()
+
+        if backup_driver_file.is_file():
+            print('Restoring the NVIDIA Open Kernel driver')
+            uninstall_nvidia_modules()
+            toggle_nvidia_drivers_setting(False)
+            toggle_editable_sysext_filesystem(True)
+
+            shutil.move(backup_driver_file, get_nvidia_proprietary_driver_file())
+
+            toggle_editable_sysext_filesystem(False)
+            toggle_nvidia_drivers_setting(True)
+            install_nvidia_modules()
+
+        # When both "gpu_passthrough_nvidia" and "force_nvidia_legacy_driver"
+        # are disabled, there's nothing more to do but short-circuit
+        if not is_gpu_passthrough_nvidia:
+            return
+
+    # Does the system actually have an NVIDIA GPU installed?
+    lspci = 'lspci -k | grep -E "VGA|3D|Display" | grep -i nvidia'
+    lspci = subprocess.run(lspci, shell=True, capture_output=True)
+
+    if not lspci.stdout.decode().strip():
+        nvidia_fail('No NVIDIA GPU detected')
+
+    if lspci.stderr:
+        nvidia_fail(lspci.stderr.decode())
+
+    # Make sure the "Install NVIDIA Drivers" configuration setting is enabled,
+    # then install the modules and driver
+    toggle_nvidia_drivers_setting(True)
+    install_nvidia_modules()
+    test_nvidia_driver()
+
+    # Replace the Open Kernel driver with the Proprietary driver when applicable
+    if is_force_nvidia_legacy_driver or is_nvidia_proprietary_driver_required():
+        install_nvidia_proprietary_driver()
+
+    # Short-circuit when the NVIDIA Proprietary driver is needed, but when
+    # NVIDIA passthrough is not
+    if not is_gpu_passthrough_nvidia:
         return
 
-    # Load the nvidia kernel module
-    if subprocess.run(["modprobe", "nvidia-current-uvm"]).returncode != 0:
-        eprint(
-            dedent(
-                """
-            Failed to load nvidia-current-uvm kernel module."""
-            )
-        )
+    # Enable Persistence mode to ensure that the NVIDIA Modeset module gets
+    # installed and to avoid repetitive GPU initialization
+    enable_nvidia_persistence_mode()
 
-    # Run nvidia-smi to initialize the nvidia driver
-    # If we can't run nvidia-smi successfully,
-    # then nvidia-container-cli list will fail too:
-    # we shouldn't continue with gpu passthrough
-    if subprocess.run(["nvidia-smi", "-f", "/dev/null"]).returncode != 0:
-        eprint("Skip passthrough of nvidia GPU.")
-        return
+    # Get list of libraries
+    nvidia_libraries = get_nvidia_driver_dependency_list(True)
+    nvidia_libraries = set([x for x in nvidia_libraries if x])
 
-    try:
-        # Get list of libraries
-        nvidia_libraries = set(
-            [
-                x
-                for x in subprocess.check_output(
-                    ["nvidia-container-cli", "list", "--libraries"]
-                )
-                .decode()
-                .split("\n")
-                if x
-            ]
-        )
-        # Get full list of files, but excluding library ones from above
-        nvidia_files = set(
-            (
-                [
-                    x
-                    for x in subprocess.check_output(["nvidia-container-cli", "list"])
-                    .decode()
-                    .split("\n")
-                    if x and x not in nvidia_libraries
-                ]
-            )
-        )
-    except Exception:
-        eprint(
-            dedent(
-                """
-        Unable to detect which nvidia driver files to mount.
-        Skip passthrough of nvidia GPU."""
-            )
-        )
-        return
+    # Get full list of files, excluding library files
+    nvidia_files = get_nvidia_driver_dependency_list()
+    nvidia_files = list(set([x for x in nvidia_files if x]) ^ nvidia_libraries)
 
-    # Also make nvidia-smi available inside the path,
-    # while mounting the symlink will be resolved and nvidia-smi will appear as a regular file
-    nvidia_files.add("/usr/bin/nvidia-smi")
+    # Ensure "nvidia-smi" is included just in case it wasn't included in the
+    # list returned by "nvidia-container-cli"; if there's a duplicate, it will
+    # automatically be excluded downstream
+    nvidia_files.append('/usr/bin/nvidia-smi')
 
-    nvidia_mounts = []
+    # Because TrueNAS CE Goldeye replaced the NVIDIA Proprietary driver with the
+    # NVIDIA Open Kernel driver, the library files, devices, modules, etc. all
+    # need to be bind mounted, especially those that exist directly in the root
+    # Multiarch directory
+    nvidia_mounts = set()
+    library_directories = set()
 
     for file_path in nvidia_files:
         if not os.path.exists(file_path):
-            # Don't try to mount files not present on the host
+            # Exclude files that don't exist
             print(f"Skipped mounting {file_path}, it doesn't exist on the host...")
             continue
 
-        if file_path.startswith("/dev/"):
-            nvidia_mounts.append(f"--bind={file_path}")
-        else:
-            nvidia_mounts.append(f"--bind-ro={file_path}")
+        # All files except for devices should be read-only
+        bind_type = 'bind' if file_path.startswith('/dev/') else 'bind-ro'
+        nvidia_mounts.add(f'--{bind_type}={file_path}')
 
-    # Check if the parent dir exists where we want to write our conf file
-    if ld_so_conf_path.parent.exists():
-        library_folders = set(str(Path(x).parent) for x in nvidia_libraries)
-        # Add the library folders as mounts
-        for lf in library_folders:
-            nvidia_mounts.append(f"--bind-ro={lf}")
+    # Add library files that are directly in the root Multiarch directory to the
+    # list of NVIDIA bind mounts because the Multiarch directory MUST NOT be
+    # bind mounted to avoid it from getting clobbered in the jail
+    for file_path in nvidia_libraries:
+        if not os.path.exists(file_path):
+            # Exclude files that don't exist
+            print(f"Skipped mounting {file_path}, it doesn't exist on the host...")
+            continue
 
-        # Only write if the conf file doesn't yet exist or has different contents
-        existing_conf_libraries = set()
-        if ld_so_conf_path.exists():
-            existing_conf_libraries.update(
-                x for x in ld_so_conf_path.read_text().splitlines() if x
-            )
+        parent_dir = str(Path(file_path).parent)
 
-        if library_folders != existing_conf_libraries:
-            print("\n".join(x for x in library_folders), file=ld_so_conf_path.open("w"))
+        if parent_dir == MULTIARCH_ROOT_PATH:
+            # Mount library files that are directly in the root Multiarch path
+            nvidia_mounts.add(f'--bind-ro={file_path}')
+            continue
 
-            # Run ldconfig inside systemd-nspawn jail with nvidia mounts...
-            subprocess.run(
-                [
-                    "systemd-nspawn",
-                    "--quiet",
-                    f"--machine={jail_name}",
-                    f"--directory={jail_rootfs_path}",
-                    *nvidia_mounts,
-                    "ldconfig",
-                ]
-            )
-    else:
-        eprint(
-            dedent(
-                """
-            Unable to write the ld.so.conf.d directory inside the jail (it doesn't exist).
-            Skipping call to ldconfig.
-            The nvidia drivers will probably not be detected..."""
-            )
-        )
+        nvidia_mounts.add(f'--bind-ro={parent_dir}')
+        library_directories.add(parent_dir)
+
+    nvidia_mounts = list(nvidia_mounts)
+    nvidia_mounts.sort()
+
+    # Confirm the parent directory exists where the config file will be written
+    if not ld_config_file.parent.exists():
+        nvidia_fail('ld.so.conf.d directory inside the jail is missing and is required to load the NVIDIA driver')
+
+    # Only write if the config file doesn't yet exist or has different contents
+    existing_library_directories = set()
+    if ld_config_file.exists():
+        existing_library_directories.update(x for x in ld_config_file.read_text().splitlines() if x)
+
+    if library_directories:
+        print('\n'.join(x for x in library_directories), file=ld_config_file.open('w'))
+
+        # Run ldconfig inside systemd-nspawn jail with the NVIDIA mounts to
+        # ensure that the libraries get linked dynamically
+        try:
+            systemd_nspawn = [
+                'systemd-nspawn',
+                '--quiet',
+                f'--machine={jail_name}',
+                f'--directory={jail_rootfs_path}',
+                *nvidia_mounts,
+                'ldconfig',
+            ]
+
+            subprocess.run(systemd_nspawn, check=True)
+        except subprocess.CalledProcessError as e:
+            nvidia_fail(f'Failed to run ldconfig inside "{jail_name}": {e}')
 
     systemd_nspawn_additional_args += nvidia_mounts
 
@@ -477,19 +839,19 @@ def exec_jail(jail_name, cmd):
     """
     Execute a command in the jail with given name.
     """
-    return subprocess.run(
-        [
-            "systemd-run",
-            "--machine",
-            jail_name,
-            "--quiet",
-            "--pipe",
-            "--wait",
-            "--collect",
-            "--service-type=exec",
-            *cmd,
-        ]
-    ).returncode
+    systemd_run = [
+        'systemd-run',
+        '--machine',
+        jail_name,
+        '--quiet',
+        '--pipe',
+        '--wait',
+        '--collect',
+        '--service-type=exec',
+        *cmd,
+    ]
+
+    return subprocess.run(systemd_run, check=True)
 
 
 def status_jail(jail_name, args):
@@ -497,18 +859,14 @@ def status_jail(jail_name, args):
     Show the status of the systemd service wrapping the jail with given name.
     """
     # Alternatively `machinectl status jail_name` could be used
-    return subprocess.run(
-        ["systemctl", "status", f"{SHORTNAME}-{jail_name}", *args]
-    ).returncode
+    return subprocess.run(["systemctl", "status", f"{SHORTNAME}-{jail_name}", *args]).returncode
 
 
 def log_jail(jail_name, args):
     """
     Show the log file of the jail with given name.
     """
-    return subprocess.run(
-        ["journalctl", "-u", f"{SHORTNAME}-{jail_name}", *args]
-    ).returncode
+    return subprocess.run(["journalctl", "-u", f"{SHORTNAME}-{jail_name}", *args]).returncode
 
 
 def shell_jail(args):
@@ -572,9 +930,7 @@ def start_jail(jail_name):
     """
     Start jail with given name.
     """
-    skip_start_message = (
-        f"Skipped starting jail {jail_name}. It appears to be running already..."
-    )
+    skip_start_message = (f'Skipped starting jail {jail_name}. It appears to be running already...')
 
     if jail_is_running(jail_name):
         eprint(skip_start_message)
@@ -587,150 +943,137 @@ def start_jail(jail_name):
     config = parse_config_file(jail_config_path)
 
     if not config:
-        eprint("Aborting...")
+        eprint('Aborting...')
         return 1
 
-    seccomp = config.my_getboolean("seccomp")
+    is_seccomp = config.my_getboolean('seccomp')
 
     systemd_run_additional_args = [
-        f"--unit={SHORTNAME}-{jail_name}",
-        f"--working-directory={jail_path}",
-        f"--description=My nspawn jail {jail_name} [created with jailmaker]",
+        f'--unit={SHORTNAME}-{jail_name}',
+        f'--working-directory={jail_path}',
+        f'--description=My nspawn jail {jail_name} [created with jailmaker]',
     ]
 
     systemd_nspawn_additional_args = [
-        f"--machine={jail_name}",
-        f"--directory={JAIL_ROOTFS_NAME}",
+        f'--machine={jail_name}',
+        f'--directory={JAIL_ROOTFS_NAME}',
     ]
 
     # The systemd-nspawn manual explicitly mentions:
-    # Device nodes may not be created
-    # https://www.freedesktop.org/software/systemd/man/systemd-nspawn.html
-    # This means docker images containing device nodes can't be pulled
-    # https://github.com/moby/moby/issues/35245
+    # * Device nodes may not be created
+    #     * @link https://www.freedesktop.org/software/systemd/man/systemd-nspawn.html
+    # * This means docker images containing device nodes can't be pulled
+    #     * @link https://github.com/moby/moby/issues/35245
     #
-    # The solution is to use DevicePolicy=auto
-    # https://github.com/kinvolk/kube-spawn/pull/328
+    # * The solution is to use DevicePolicy=auto
+    #     * @link https://github.com/kinvolk/kube-spawn/pull/328
     #
-    # DevicePolicy=auto is the default for systemd-run and allows access to all devices
-    # as long as we don't add any --property=DeviceAllow= flags
-    # https://manpages.debian.org/bookworm/systemd/systemd.resource-control.5.en.html
+    # * DevicePolicy=auto is the default for systemd-run and allows access to
+    # all devices as long as we don't add any --property=DeviceAllow= flags
+    #     * @link https://manpages.debian.org/bookworm/systemd/systemd.resource-control.5.en.html
     #
     # We can now successfully run:
     # mknod /dev/port c 1 4
     # Or pull docker images containing device nodes:
     # docker pull oraclelinux@sha256:d49469769e4701925d5145c2676d5a10c38c213802cf13270ec3a12c9c84d643
 
-    # Add hooks to execute commands on the host before/after starting and after stopping a jail
-    add_hook(
-        jail_path,
-        systemd_run_additional_args,
-        config.my_get("pre_start_hook"),
-        "ExecStartPre",
-    )
+    # Add hooks to execute commands on the host before/after starting and after
+    # stopping a jail
+    add_hook(jail_path, systemd_run_additional_args, config.my_get('pre_start_hook'), 'ExecStartPre')
+    add_hook(jail_path, systemd_run_additional_args, config.my_get('post_start_hook'), 'ExecStartPost')
+    add_hook(jail_path, systemd_run_additional_args, config.my_get('post_stop_hook'), 'ExecStopPost')
 
-    add_hook(
-        jail_path,
-        systemd_run_additional_args,
-        config.my_get("post_start_hook"),
-        "ExecStartPost",
-    )
-
-    add_hook(
-        jail_path,
-        systemd_run_additional_args,
-        config.my_get("post_stop_hook"),
-        "ExecStopPost",
-    )
-
-    gpu_passthrough_intel = config.my_getboolean("gpu_passthrough_intel")
-    gpu_passthrough_nvidia = config.my_getboolean("gpu_passthrough_nvidia")
-
-    passthrough_intel(gpu_passthrough_intel, systemd_nspawn_additional_args)
+    passthrough_intel(config.my_getboolean('gpu_passthrough_intel'), systemd_nspawn_additional_args)
     passthrough_nvidia(
-        gpu_passthrough_nvidia, systemd_nspawn_additional_args, jail_name
+        config.my_getboolean('gpu_passthrough_nvidia'),
+        config.my_getboolean('force_nvidia_legacy_driver'),
+        systemd_nspawn_additional_args,
+        jail_name
     )
 
-    if seccomp is False:
-        # Disabling seccomp filtering by passing --setenv=SYSTEMD_SECCOMP=0 to systemd-run will improve performance
-        # at the expense of security: it allows syscalls which otherwise would be blocked or would have to be explicitly allowed by passing
+    if is_seccomp is False:
+        # Disabling seccomp filtering by passing --setenv=SYSTEMD_SECCOMP=0 to
+        # systemd-run will improve performance at the expense of security: it
+        # allows syscalls which otherwise would be blocked or would have to be
+        # explicitly allowed by passing
         # --system-call-filter to systemd-nspawn
-        # https://github.com/systemd/systemd/issues/18370
+        # @link https://github.com/systemd/systemd/issues/18370
         #
-        # However, and additional layer of seccomp filtering may be undesirable
-        # For example when using docker to run containers inside the jail created with systemd-nspawn
-        # Even though seccomp filtering is disabled for the systemd-nspawn jail itself, docker can still use seccomp filtering
-        # to restrict the actions available within its containers
+        # However, an additional layer of seccomp filtering may be undesirable.
+        # For example when using docker to run containers inside the jail
+        # created with systemd-nspawn. Even though seccomp filtering is disabled
+        # for the systemd-nspawn jail itself, docker can still use seccomp
+        # filtering to restrict the actions available within its containers.
         #
-        # Proof that seccomp can be used inside a jail started with --setenv=SYSTEMD_SECCOMP=0:
-        # Run a command in a docker container which is blocked by the default docker seccomp profile:
-        # 	docker run --rm -it debian:jessie unshare --map-root-user --user sh -c whoami
-        # 	unshare: unshare failed: Operation not permitted
+        # Proof that seccomp can be used inside a jail started with
+        # --setenv=SYSTEMD_SECCOMP=0
+        #
+        # Run a command in a docker container which is blocked by the default
+        # docker seccomp profile:
+        #
+        # $ docker run --rm -it debian:jessie unshare --map-root-user --user sh -c whoami
+        # unshare: unshare failed: Operation not permitted
+        #
         # Now run unconfined to show command runs successfully:
-        # 	docker run --rm -it --security-opt seccomp=unconfined debian:jessie unshare --map-root-user --user sh -c whoami
-        # 	root
-
-        systemd_run_additional_args += [
-            "--setenv=SYSTEMD_SECCOMP=0",
-        ]
+        #
+        # $ docker run --rm -it --security-opt seccomp=unconfined debian:jessie unshare --map-root-user --user sh -c whoami
+        # root
+        systemd_run_additional_args += ['--setenv=SYSTEMD_SECCOMP=0']
 
     initial_setup = False
 
     # If there's no machine-id, then this the first time the jail is started
-    if not os.path.exists(os.path.join(jail_rootfs_path, "etc/machine-id")) and (
-        initial_setup := config.my_get("initial_setup")
-    ):
-        # initial_setup has been assigned due to := expression above
-        # Ensure the jail init system is ready before we start the initial_setup
-        systemd_nspawn_additional_args += [
-            "--notify-ready=yes",
-        ]
+    is_machine_id = os.path.exists(os.path.join(jail_rootfs_path, 'etc/machine-id'))
 
-    cmd = [
-        "systemd-run",
-        *shlex.split(config.my_get("systemd_run_default_args")),
+    # Only initialize initial_setup when creating a new jail from a template
+    if not is_machine_id and (initial_setup := config.my_get('initial_setup')):
+        # Ensure the jail init system is ready before starting the initial_setup
+        systemd_nspawn_additional_args += ['--notify-ready=yes']
+
+    systemd_run = [
+        'systemd-run',
+        *shlex.split(config.my_get('systemd_run_default_args')),
         *systemd_run_additional_args,
-        "--",
-        "systemd-nspawn",
-        *shlex.split(config.my_get("systemd_nspawn_default_args")),
+        '--',
+        'systemd-nspawn',
+        *shlex.split(config.my_get('systemd_nspawn_default_args')),
         *systemd_nspawn_additional_args,
-        *shlex.split(config.my_get("systemd_nspawn_user_args")),
+        *shlex.split(config.my_get('systemd_nspawn_user_args')),
     ]
 
-    print(
-        dedent(
-            f"""
+    print(dedent(
+        f"""
         Starting jail {jail_name} with the following command:
 
-        {shlex.join(cmd)}
-    """
-        )
-    )
+        {shlex.join(systemd_run)}
+        """
+    ))
 
-    returncode = subprocess.run(cmd).returncode
-    if returncode != 0:
-        eprint(
-            dedent(
-                f"""
+    try:
+        systemd_run = subprocess.run(systemd_run, check=True)
+    except subprocess.CalledProcessError as e:
+        eprint(dedent(
+            f"""
             Failed to start jail {jail_name}...
             In case of a config error, you may fix it with:
             {COMMAND_NAME} edit {jail_name}
-        """
-            )
-        )
+            """
+        ))
 
-        return returncode
+        return e.returncode
+
+    return_code = systemd_run.returncode
 
     # Handle initial setup after jail is up and running (for the first time)
     if initial_setup:
-        if not initial_setup.startswith("#!"):
-            initial_setup = "#!/bin/sh\n" + initial_setup
+        if not initial_setup.startswith('#!'):
+            initial_setup = f'#!/bin/sh\n{initial_setup}'
 
         with tempfile.NamedTemporaryFile(
-            mode="w+t",
-            prefix="jlmkr-initial-setup.",
-            dir=jail_rootfs_path,
-            delete=False,
+            mode = 'w+t',
+            prefix = 'jlmkr-initial-setup.',
+            dir = jail_rootfs_path,
+            delete = False
         ) as initial_setup_file:
             # Write a script file to call during initial setup
             initial_setup_file.write(initial_setup)
@@ -739,43 +1082,40 @@ def start_jail(jail_name):
         initial_setup_file_host_path = os.path.abspath(initial_setup_file.name)
         stat_chmod(initial_setup_file_host_path, 0o700)
 
-        print(f"About to run the initial setup script: {initial_setup_file_name}.")
-        print("Waiting for networking in the jail to be ready.")
-        print(
-            "Please wait (this may take 90s in case of bridge networking with STP is enabled)..."
-        )
-        returncode = exec_jail(
-            jail_name,
-            [
-                "--",
-                "systemd-run",
-                f"--unit={initial_setup_file_name}",
-                "--quiet",
-                "--pipe",
-                "--wait",
-                "--service-type=exec",
-                "--property=After=network-online.target",
-                "--property=Wants=network-online.target",
-                "/" + initial_setup_file_name,
-            ],
-        )
+        print(f'About to run the initial setup script: {initial_setup_file_name}.')
+        print('Waiting for networking in the jail to be ready.')
+        print('Please wait (this may take 90s in case of bridge networking with STP is enabled)...')
 
-        if returncode != 0:
-            eprint("Tried to run the following commands inside the jail:")
+        try:
+            systemd_run = exec_jail(jail_name, [
+                '--',
+                'systemd-run',
+                f'--unit={initial_setup_file_name}',
+                '--quiet',
+                '--pipe',
+                '--wait',
+                '--service-type=exec',
+                '--property=After=network-online.target',
+                '--property=Wants=network-online.target',
+                f'/{initial_setup_file_name}',
+            ])
+        except subprocess.CalledProcessError as e:
+            eprint('Tried to run the following commands inside the jail:')
             eprint(initial_setup)
             eprint()
-            eprint(f"{RED}{BOLD}Failed to run initial setup...")
-            eprint(
-                f"You may want to manually run /{initial_setup_file_name} inside the jail for debugging purposes."
-            )
-            eprint(f"Or stop and remove the jail and try again.{NORMAL}")
-            return returncode
-        else:
-            # Cleanup the initial_setup_file_host_path
-            Path(initial_setup_file_host_path).unlink(missing_ok=True)
-            print(f"Done with initial setup of jail {jail_name}!")
+            eprint(f'{RED}{BOLD}Failed to run initial setup...')
+            eprint(f'You may want to manually run /{initial_setup_file_name} inside the jail for debugging purposes.')
+            eprint(f'Or stop and remove the jail and try again.{NORMAL}')
 
-    return returncode
+            return e.returncode
+
+        return_code = systemd_run.returncode
+
+        # Clean up the initial_setup_file_host_path
+        Path(initial_setup_file_host_path).unlink(missing_ok=True)
+        print(f'Done with initial setup of jail {jail_name}!')
+
+    return return_code
 
 
 def restart_jail(jail_name):
@@ -860,7 +1200,7 @@ def run_lxc_download_script(
     except FileNotFoundError:
         pass
 
-    # Fetch the lxc download script if not present locally (or hash doesn't match)
+    # Fetch the LXC download script if not present locally (or hash doesn't match)
     if not validate_sha256(lxc_download_script, DOWNLOAD_SCRIPT_DIGEST):
         urllib.request.urlretrieve(
             "https://raw.githubusercontent.com/Jip-Hop/lxc/b24d2d45b3875b013131b480e61c93b6fb8ea70c/templates/lxc-download.in",
@@ -887,7 +1227,6 @@ def run_lxc_download_script(
         if rc := subprocess.run(cmd, env={"LXC_CACHE_PATH": lxc_cache}).returncode != 0:
             eprint("Aborting...")
             return rc
-
     else:
         # List images
         cmd = [lxc_download_script, "--list", f"--arch={arch}"]
@@ -1070,32 +1409,31 @@ def interactive_config():
     config = KeyValueParser()
     config.read_string(DEFAULT_CONFIG)
 
-    recommended_distro = config.my_get("distro")
-    recommended_release = config.my_get("release")
+    recommended_distro = config.my_get('distro')
+    recommended_release = config.my_get('release')
 
     #################
     # Config handling
     #################
-    jail_name = ""
+    jail_name = ''
 
     print()
-    if agree("Do you wish to create a jail from a config template?", "n"):
-        print(
-            dedent(
-                """
+    if agree('Do you wish to create a jail from a config template?', 'n'):
+        print(dedent(
+            """
             A text editor will open so you can provide the config template.
 
               1. Please copy your config
               2. Paste it into the text editor
               3. Save and close the text editor
-        """
-            )
-        )
-        input("Press Enter to open the text editor.")
+            """
+        ))
+        input('Press Enter to open the text editor.')
 
-        with tempfile.NamedTemporaryFile(mode="w+t") as f:
+        with tempfile.NamedTemporaryFile(mode = 'w+t') as f:
             subprocess.call([get_text_editor(), f.name])
             f.seek(0)
+
             # Start over with a new KeyValueParser to parse user config
             config = KeyValueParser()
             config.read_file(f)
@@ -1104,96 +1442,80 @@ def interactive_config():
         jail_name = ask_jail_name(jail_name)
     else:
         print()
-        if not agree(
-            f"Install the recommended image ({recommended_distro} {recommended_release})?",
-            "y",
-        ):
-            print(
-                dedent(
-                    f"""
+        if not agree(f'Install the recommended image ({recommended_distro} {recommended_release})?', 'y'):
+            print(dedent(
+                f"""
                 {YELLOW}{BOLD}WARNING: ADVANCED USAGE{NORMAL}
 
                 You may now choose from a list which distro to install.
                 But not all of them may work with {COMMAND_NAME} since these images are made for LXC.
                 Distros based on systemd probably work (e.g. Ubuntu, Arch Linux and Rocky Linux).
-            """
-                )
-            )
-            input("Press Enter to continue...")
+                """
+            ))
+
+            input('Press Enter to continue...')
             print()
 
             if run_lxc_download_script() != 0:
                 fail("Failed to list images. Aborting...")
 
-            print(
-                dedent(
-                    """
-                Choose from the DIST column.
-            """
-                )
-            )
+            print()
+            print('Choose from the DIST column.')
+            print()
+            config.my_set('distro', input('Distro: '))
 
-            config.my_set("distro", input("Distro: "))
-
-            print(
-                dedent(
-                    """
-                Choose from the RELEASE column (or ARCH if RELEASE is empty).
-            """
-                )
-            )
-
-            config.my_set("release", input("Release: "))
+            print()
+            print('Choose from the RELEASE column (or ARCH if RELEASE is empty).')
+            print()
+            config.my_set('release', input('Release: '))
 
         jail_name = ask_jail_name(jail_name)
 
         print()
-        agree_with_default(
-            config, "gpu_passthrough_intel", "Passthrough the intel GPU (if present)?"
-        )
+        agree_with_default(config, 'gpu_passthrough_intel', 'Passthrough the intel GPU (if present)?')
+
+        print()
+        agree_with_default(config, 'gpu_passthrough_nvidia', 'Passthrough the nvidia GPU (if present)?')
+
         print()
         agree_with_default(
-            config, "gpu_passthrough_nvidia", "Passthrough the nvidia GPU (if present)?"
+            config,
+            'force_nvidia_legacy_driver',
+            'Force the NVIDIA Proprietary driver for TrueNAS CE Goldeye and newer (if GPU present)?'
         )
 
-        print(
-            dedent(
-                f"""
+        print(dedent(
+            f"""
             {YELLOW}{BOLD}WARNING: CHECK SYNTAX{NORMAL}
 
             You may pass additional flags to systemd-nspawn.
             With incorrect flags the jail may not start.
             It is possible to correct/add/remove flags post-install.
-        """
-            )
-        )
+            """
+        ))
 
-        if agree("Show the man page for systemd-nspawn?", "n"):
-            subprocess.run(["man", "systemd-nspawn"])
+        if agree('Show the man page for systemd-nspawn?', 'n'):
+            subprocess.run(['man', 'systemd-nspawn'])
         else:
             try:
-                base_os_version = platform.freedesktop_os_release().get(
-                    "VERSION_CODENAME", recommended_release
-                )
+                base_os_version = platform.freedesktop_os_release().get('VERSION_CODENAME', recommended_release)
             except AttributeError:
                 base_os_version = recommended_release
-            print(
-                dedent(
-                    f"""
+
+            print(dedent(
+                f"""
                 You may read the systemd-nspawn manual online:
-                https://manpages.debian.org/{base_os_version}/systemd-container/systemd-nspawn.1.en.html"""
-                )
-            )
+                https://manpages.debian.org/{base_os_version}/systemd-container/systemd-nspawn.1.en.html
+                """
+            ))
 
         # Backslashes and colons need to be escaped in bind mount options:
         # e.g. to bind mount a file called:
         # weird chars :?\"
         # the corresponding command would be:
         # --bind-ro='/mnt/data/weird chars \:?\\"'
-
-        print(
-            dedent(
-                """
+        print(dedent(
+            """
             Would you like to add additional systemd-nspawn flags?
             For example to mount directories inside the jail you may:
             Mount the TrueNAS location /mnt/pool/dataset to the /home directory of the jail with:
@@ -1202,35 +1524,26 @@ def interactive_config():
             --bind-ro='/mnt/pool/dataset:/home'
             Or create macvlan interface with:
             --network-macvlan=eno1 --resolv-conf=bind-host
-        """
-            )
-        )
+            """
+        ))
 
         config.my_set(
-            "systemd_nspawn_user_args",
-            "\n    ".join(shlex.split(input("Additional flags: ") or "")),
+            'systemd_nspawn_user_args',
+            '\n    '.join(shlex.split(input('Additional flags: ') or '')),
         )
 
-        print(
-            dedent(
-                f"""
+        print(dedent(
+            f"""
             The `{COMMAND_NAME} startup` command can automatically start a selection of jails.
             This comes in handy when you want to automatically start multiple jails after booting TrueNAS SCALE (e.g. from a Post Init Script).
-        """
-            )
-        )
+            """
+        ))
 
-        config.my_set(
-            "startup",
-            agree(
-                f"Do you want to start this jail when running: {COMMAND_NAME} startup?",
-                "n",
-            ),
-        )
+        is_startup = agree(f'Do you want to start this jail when running: {COMMAND_NAME} startup?', 'n')
+        config.my_set('startup', is_startup)
 
     print()
-    start_now = agree("Do you want to start this jail now (when create is done)?", "y")
-
+    start_now = agree('Do you want to start this jail now (when create is done)?', 'y')
     print()
 
     return jail_name, config, start_now
@@ -1302,13 +1615,14 @@ def create_jail(**kwargs):
         user_overridden = False
 
         for option in [
-            "distro",
-            "gpu_passthrough_intel",
-            "gpu_passthrough_nvidia",
-            "release",
-            "seccomp",
-            "startup",
-            "systemd_nspawn_user_args",
+            'distro',
+            'gpu_passthrough_intel',
+            'gpu_passthrough_nvidia',
+            'force_nvidia_legacy_driver',
+            'release',
+            'seccomp',
+            'startup',
+            'systemd_nspawn_user_args',
         ]:
             value = kwargs.pop(option)
             if (
@@ -1595,6 +1909,8 @@ def stop_jail(jail_name):
     while jail_is_running(jail_name):
         time.sleep(1)
         print(".", end="", flush=True)
+
+    print('\n\n')
 
     return 0
 
@@ -1970,6 +2286,12 @@ def main():
         type=int,
         choices=[0, 1],
     )
+    commands['create'].add_argument(
+        '-fl',
+        '--force_nvidia_legacy_driver',
+        type = int,
+        choices = [0, 1]
+    )
     commands["create"].add_argument(
         "systemd_nspawn_user_args",
         nargs="*",
@@ -1981,7 +2303,7 @@ def main():
         fail("Run this script as root...")
 
     # Set appropriate permissions (if not already set) for this file, since it's executed as root
-    stat_chmod(SCRIPT_PATH, 0o700)
+    stat_chmod(SCRIPT_PATH, 0o760)
 
     # Ignore all args after the first "--"
     args_to_parse = split_at_string(sys.argv[1:], "--")[0]
