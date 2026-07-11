@@ -2106,9 +2106,12 @@ def remove_jail(jail_name):
         eprint(f'A jail with name {jail_name} does not exist.')
         return 1
 
-    # TODO: print which dataset is about to be removed before the user confirmation
-    # TODO: print that all zfs snapshots will be removed if jail has it's own zfs dataset
-    check = input(f'\nCAUTION: Type "{jail_name}" to confirm jail deletion!\n\n')
+    dataset = get_zfs_dataset(get_jail_path(jail_name))
+
+    if dataset:
+        print(f'\n{RED}DANGER: THE {UNDERLINE}"{dataset}"{NORMAL}{RED} DATASET IS GOING TO BE DELETED ALONG WITH ALL ZFS SNAPSHOTS.{NORMAL}')
+
+    check = input(f'\n{YELLOW}CAUTION: Type "{jail_name}" to confirm jail deletion!\n\n{NORMAL}')
 
     if check != jail_name:
         eprint('Wrong name, nothing happened.')
