@@ -14,6 +14,7 @@ IT COMES WITHOUT WARRANTY AND IS NOT SUPPORTED BY IXSYSTEMS."""
 
 import argparse
 import configparser
+import csv
 import hashlib
 import io
 import json
@@ -1710,6 +1711,24 @@ def interactive_config():
     return jail_name, config, is_start_now
 
 
+def get_jail_os_info(jail_name):
+    os_info = {}
+
+    with Chroot(get_jail_rootfs_path(jail_name)):
+        # Use chroot to correctly resolve os-release symlink (for nixos)
+        for os_release in ['/etc/os-release', '/usr/lib/os-release']:
+            try:
+                os_release = Path(os_release).read_text('utf-8')
+                os_release = csv.reader(os_release.splitlines(), delimiter='=')
+                os_info = dict(os_release)
+                break
+            except (OSError, FileNotFoundError, PermissionError, UnicodeDecodeError):
+                # Ignore failure and just continue
+                pass
+
+    return os_info
+
+
 def create_jail(**kwargs):
     print(DISCLAIMER)
 
@@ -1875,7 +1894,9 @@ def create_jail(**kwargs):
         with Chroot(jail_rootfs_path):
             system_name = Path('/sbin/init').resolve().name
 
-        if system_name != 'systemd' and parse_os_release(jail_rootfs_path).get('ID') != 'nixos':
+        os_id = get_jail_os_info(jail_name).get('ID')
+
+        if system_name != 'systemd' and os_id and os_id != 'nixos':
             print(dedent(
                 f"""
                 {YELLOW}{BOLD}WARNING: DISTRO NOT SUPPORTED{NORMAL}
@@ -2114,29 +2135,9 @@ def print_table(header, list_of_objects, empty_value_indicator):
 
 def get_all_jail_names():
     try:
-        jail_names = [jail_dir.name for jail_dir in JAILS_DIR_PATH.iterdir()]
+        return [jail_dir.name for jail_dir in JAILS_DIR_PATH.iterdir()]
     except FileNotFoundError:
-        jail_names = []
-
-    return jail_names
-
-
-def parse_os_release(new_root):
-    result = {}
-
-    with Chroot(new_root):
-        # Use chroot to correctly resolve os-release symlink (for nixos)
-        for candidate in ['/etc/os-release', '/usr/lib/os-release']:
-            try:
-                with Path(candidate).open(encoding='utf-8') as f:
-                    # TODO: Is there a solution which doesn't depend on the internal _parse_os_release method?
-                    result = platform._parse_os_release(f)
-                    break
-            except OSError:
-                # Silently ignore failing to read os release info
-                pass
-
-    return result
+        return []
 
 
 def list_jails():
@@ -2152,7 +2153,7 @@ def list_jails():
         print('No jails.')
         return 0
 
-    # Get running jails from machinectl
+    # Get all jails that are actively running
     running_machines = []
 
     try:
@@ -2171,40 +2172,40 @@ def list_jails():
     }
 
     for jail_name in jail_names:
-        jail_rootfs_path = get_jail_rootfs_path(jail_name)
         jails[jail_name] = {'name': jail_name, 'running': False}
         jail = jails[jail_name]
 
         config = parse_config_file(get_jail_config_path(jail_name))
+
         if config:
             jail['startup'] = config.my_getboolean('startup')
             jail['gpu_intel'] = config.my_getboolean('gpu_passthrough_intel')
             jail['gpu_nvidia'] = config.my_getboolean('gpu_passthrough_nvidia')
 
-        if jail_name in running_machines:
-            machine = running_machines[jail_name]
+        if jail_name not in running_machines:
+            # Manually parse os-release
+            os_info = get_jail_os_info(jail_name)
 
-            # Augment the jails dict with output from machinectl
-            jail['running'] = True
-            jail['os'] = machine['os'] or None
-            jail['version'] = machine['version'] or None
+            jail['os'] = os_info.get('ID')
+            jail['version'] = os_info.get('VERSION_ID') or os_info.get('VERSION_CODENAME')
 
-            addresses = machine.get('addresses')
+            continue
 
-            if not addresses:
-                jail['addresses'] = empty_value_indicator
-            else:
-                addresses = addresses.split('\n')
-                jail['addresses'] = addresses[0]
+        machine = running_machines[jail_name]
 
-                if len(addresses) > 1:
-                    jail['addresses'] += '…'
-        else:
-            # Parse os-release info ourselves
-            jail_platform = parse_os_release(jail_rootfs_path)
+        # Augment the jails dict with output from machinectl
+        jail['running'] = True
+        jail['os'] = machine['os'] or None
+        jail['version'] = machine['version'] or None
+        jail['addresses'] = empty_value_indicator
 
-            jail['os'] = jail_platform.get('ID')
-            jail['version'] = jail_platform.get('VERSION_ID') or jail_platform.get('VERSION_CODENAME')
+        addresses = machine.get('addresses')
+
+        if not addresses:
+            continue
+
+        addresses = addresses.split('\n')
+        jail['addresses'] = addresses[0] + ('...' if len(addresses) > 1 else '')
 
     print_table(
         [
