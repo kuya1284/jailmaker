@@ -935,22 +935,36 @@ def status_jail(jail_name, args):
     Shows the status of the systemd service wrapping the jail with the
     given name.
     """
-    # Alternatively `machinectl status jail_name` could be used
-    return subprocess.run(['systemctl', 'status', f'{SHORTNAME}-{jail_name}', *args]).returncode
+    try:
+        subprocess.run(['machinectl', 'status', jail_name, *args], check=True)
+    except subprocess.CalledProcessError as e:
+        return e.returncode
+
+    return 0
 
 
 def log_jail(jail_name, args):
     """
     Shows the log file of the jail with given name.
     """
-    return subprocess.run(['journalctl', '-u', f'{SHORTNAME}-{jail_name}', *args]).returncode
+    try:
+        subprocess.run(['journalctl', '-u', f'{SHORTNAME}-{jail_name}', *args], check=True)
+    except subprocess.CalledProcessError as e:
+        return e.returncode
+
+    return 0
 
 
 def shell_jail(args):
     """
     Opens a shell in the jail with given name.
     """
-    return subprocess.run(['machinectl', 'shell'] + args).returncode
+    try:
+        subprocess.run(['machinectl', 'shell'] + args, check=True)
+    except subprocess.CalledProcessError as e:
+        return e.returncode
+
+    return 0
 
 
 def parse_config_file(jail_config_path):
@@ -1006,10 +1020,8 @@ def start_jail(jail_name):
     """
     Starts jail with given name.
     """
-    skip_start_message = (f'Skipped starting jail {jail_name}. It appears to be running already...')
-
     if jail_is_running(jail_name):
-        eprint(skip_start_message)
+        eprint(f'Skipped starting jail {jail_name}. It appears to be running already...')
         return 0
 
     jail_path = get_jail_path(jail_name)
@@ -1312,7 +1324,7 @@ def run_lxc_download_script(
     stat_chmod(lxc_download_script, 0o700)
 
     if None not in [jail_name, jail_path, jail_rootfs_path, distro, release]:
-        cmd = [
+        lxc_download = [
             lxc_download_script,
             f'--name={jail_name}',
             f'--path={jail_path}',
@@ -1322,14 +1334,16 @@ def run_lxc_download_script(
             f'--release={release}',
         ]
 
-        if rc := subprocess.run(cmd, env={'LXC_CACHE_PATH': lxc_cache}).returncode != 0:
+        try:
+            subprocess.run(lxc_download, check=True, env={'LXC_CACHE_PATH': str(lxc_cache)})
+        except subprocess.CalledProcessError as e:
             eprint('Aborting...')
-            return rc
+            return e.returncode
     else:
         # List images
-        cmd = [lxc_download_script, '--list', f'--arch={arch}']
+        lxc_download = [lxc_download_script, '--list', f'--arch={arch}']
 
-        p1 = subprocess.Popen(cmd, stdout=subprocess.PIPE, env={'LXC_CACHE_PATH': lxc_cache})
+        p1 = subprocess.Popen(lxc_download, stdout=subprocess.PIPE, env={'LXC_CACHE_PATH': str(lxc_cache)})
 
         for line in iter(p1.stdout.readline, b''):
             line = line.decode().strip()
@@ -1989,11 +2003,12 @@ def create_jail(**kwargs):
 
 
 def jail_is_running(jail_name):
-    return subprocess.run(
-        ['machinectl', 'show', jail_name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode == 0
+    try:
+        subprocess.run(['machinectl', 'show', jail_name], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        return False
+
+    return True
 
 
 def edit_jail(jail_name):
@@ -2009,11 +2024,11 @@ def edit_jail(jail_name):
 
     jail_config_path = get_jail_config_path(jail_name)
 
-    returncode = subprocess.run([get_text_editor(), jail_config_path]).returncode
-
-    if returncode != 0:
+    try:
+        subprocess.run([get_text_editor(), jail_config_path], check=True)
+    except subprocess.CalledProcessError as e:
         eprint(f'An error occurred while editing {jail_config_path}.')
-        return returncode
+        return e.returncode
 
     if jail_is_running(jail_name):
         print()
@@ -2029,11 +2044,11 @@ def stop_jail(jail_name):
     if not jail_is_running(jail_name):
         return 0
 
-    returncode = subprocess.run(['machinectl', 'poweroff', jail_name]).returncode
-
-    if returncode != 0:
+    try:
+        subprocess.run(['machinectl', 'poweroff', jail_name], check=True)
+    except subprocess.CalledProcessError as e:
         eprint('Error while stopping jail.')
-        return returncode
+        return e.returncode
 
     print(f'Wait for {jail_name} to stop', end='', flush=True)
 
