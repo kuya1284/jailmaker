@@ -2252,7 +2252,7 @@ def add_parser(subparser, **kwargs):
     is_split_args = kwargs.pop('split_args', False)
 
     # Additional positional arguments
-    positional_args = kwargs.pop('positional_args', None)
+    options_or_positional_args = kwargs.pop('options_or_positional_args', [])
 
     # Never add help with the built-in add_help because it'll be added
     # below as needed
@@ -2275,10 +2275,14 @@ def add_parser(subparser, **kwargs):
             action='store_true'
         )
 
-    if positional_args:
-        for params in positional_args:
-            name_or_flags = params.pop('name_or_flags')
-            parser.add_argument(name_or_flags, **params)
+    for params in options_or_positional_args:
+        name_or_flags = params.pop('name_or_flags')
+
+        if isinstance(name_or_flags, list):
+            parser.add_argument(*name_or_flags, **params)
+            continue
+
+        parser.add_argument(name_or_flags, **params)
 
     # Setting the add_help after the parser has been created with
     # add_parser() has no effect, but it allows a lookup if this parser
@@ -2307,25 +2311,70 @@ def init_commands(parser):
             'help': 'create a new jail',
             'func': create_jail,
             'split_args': True,
-            'positional_args': [jail_name_help | {'nargs': '?'}],
+            'options_or_positional_args': [
+                jail_name_help | {'nargs': '?'},
+                {'name_or_flags': '--distro'},
+                {'name_or_flags': '--release'},
+                {
+                    'name_or_flags': '--start',
+                    'help': 'start jail after create',
+                    'action': 'store_true',
+                },
+                {
+                    'name_or_flags': '--startup',
+                    'type': int,
+                    'choices': [0, 1],
+                    'help': f'start this jail when running: {SCRIPT_NAME} startup',
+                },
+                {
+                    'name_or_flags': '--seccomp',
+                    'type': int,
+                    'choices': [0, 1],
+                    'help': 'turning off seccomp filtering improves performance at the expense of security',
+                },
+                {
+                    'name_or_flags': ['-c', '--config'],
+                    'help': 'path to config file template or - for stdin',
+                },
+                {
+                    'name_or_flags': ['-gi', '--gpu_passthrough_intel'],
+                    'type': int,
+                    'choices': [0, 1],
+                },
+                {
+                    'name_or_flags': ['-gn', '--gpu_passthrough_nvidia'],
+                    'type': int,
+                    'choices': [0, 1],
+                },
+                {
+                    'name_or_flags': ['-fl', '--force_nvidia_legacy_driver'],
+                    'type': int,
+                    'choices': [0, 1],
+                },
+                {
+                    'name_or_flags': 'systemd_nspawn_user_args',
+                    'nargs': '*',
+                    'help': 'add additional systemd-nspawn flags',
+                },
+            ],
         },
         {
             'name': 'edit',
             'help': f'edit jail config with {get_text_editor()} text editor',
             'func': edit_jail,
-            'positional_args': [jail_name_help.copy()],
+            'options_or_positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'exec',
             'help': 'execute a command in the jail',
             'func': exec_jail,
             'split_args': True,
-            'positional_args': [
+            'options_or_positional_args': [
                 jail_name_help.copy(),
                 {
                     'name_or_flags': 'cmd',
                     'nargs': '*',
-                    'help': 'command to execute'
+                    'help': 'command to execute',
                 },
             ],
         },
@@ -2344,12 +2393,12 @@ def init_commands(parser):
             'help': 'show jail log',
             'func': log_jail,
             'split_args': True,
-            'positional_args': [
+            'options_or_positional_args': [
                 jail_name_help.copy(),
                 {
                     'name_or_flags': 'args',
                     'nargs': '*',
-                    'help': 'args to pass to journalctl'
+                    'help': 'args to pass to journalctl',
                 },
             ],
         },
@@ -2357,24 +2406,24 @@ def init_commands(parser):
             'name': 'remove',
             'help': 'remove previously created jail',
             'func': remove_jail,
-            'positional_args': [jail_name_help.copy()],
+            'options_or_positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'restart',
             'help': 'restart a running jail',
             'func': restart_jail,
-            'positional_args': [jail_name_help.copy()],
+            'options_or_positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'shell',
             'help': 'open shell in running jail (alias for machinectl shell)',
             'func': shell_jail,
             'add_help': False,
-            'positional_args': [
+            'options_or_positional_args': [
                 {
                     'name_or_flags': 'args',
                     'nargs': '*',
-                    'help': 'args to pass to machinectl shell'
+                    'help': 'args to pass to machinectl shell',
                 },
             ],
         },
@@ -2382,7 +2431,7 @@ def init_commands(parser):
             'name': 'start',
             'help': 'start previously created jail',
             'func': start_jail,
-            'positional_args': [jail_name_help.copy()],
+            'options_or_positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'startup',
@@ -2394,12 +2443,12 @@ def init_commands(parser):
             'help': 'show jail status',
             'func': status_jail,
             'split_args': True,
-            'positional_args': [
+            'options_or_positional_args': [
                 jail_name_help.copy(),
                 {
                     'name_or_flags': 'args',
                     'nargs': '*',
-                    'help': 'args to pass to systemctl'
+                    'help': 'args to pass to systemctl',
                 },
             ],
         },
@@ -2407,7 +2456,7 @@ def init_commands(parser):
             'name': 'stop',
             'help': 'stop a running jail',
             'func': stop_jail,
-            'positional_args': [jail_name_help.copy()],
+            'options_or_positional_args': [jail_name_help.copy()],
         },
     ]
 
@@ -2416,50 +2465,6 @@ def init_commands(parser):
     for definition in command_definitions:
         command = definition.get('name')
         commands[command] = add_parser(subparsers, **definition)
-
-    commands['create'].add_argument('--distro')
-    commands['create'].add_argument('--release')
-    commands['create'].add_argument('--start', help='start jail after create', action='store_true')
-    commands['create'].add_argument(
-        '--startup',
-        type=int,
-        choices=[0, 1],
-        help=f'start this jail when running: {SCRIPT_NAME} startup',
-    )
-    commands['create'].add_argument(
-        '--seccomp',
-        type=int,
-        choices=[0, 1],
-        help='turning off seccomp filtering improves performance at the expense of security',
-    )
-    commands['create'].add_argument(
-        '-c',
-        '--config',
-        help='path to config file template or - for stdin',
-    )
-    commands['create'].add_argument(
-        '-gi',
-        '--gpu_passthrough_intel',
-        type=int,
-        choices=[0, 1],
-    )
-    commands['create'].add_argument(
-        '-gn',
-        '--gpu_passthrough_nvidia',
-        type=int,
-        choices=[0, 1],
-    )
-    commands['create'].add_argument(
-        '-fl',
-        '--force_nvidia_legacy_driver',
-        type = int,
-        choices = [0, 1]
-    )
-    commands['create'].add_argument(
-        'systemd_nspawn_user_args',
-        nargs='*',
-        help='add additional systemd-nspawn flags',
-    )
 
     return commands
 
