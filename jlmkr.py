@@ -132,6 +132,7 @@ systemd_nspawn_default_args=--bind-ro=/sys/module
 # <https://manpages.debian.org/bookworm/manpages/sysfs.5.en.html>
 
 DOWNLOAD_SCRIPT_DIGEST = '645ba65a8846a2f402fc8bd870029b95fbcd3128e3046cd55642d577652cb0a0'
+DOWNLOAD_SCRIPT_URL = 'https://raw.githubusercontent.com/Jip-Hop/lxc/b24d2d45b3875b013131b480e61c93b6fb8ea70c/templates/lxc-download.in'
 MULTIARCH_ROOT_PATH = '/usr/lib/x86_64-linux-gnu'
 SYSEXT_PATH = '/usr/share/truenas/sysext-extensions'
 SCRIPT_PATH = Path(__file__).resolve()
@@ -1247,15 +1248,16 @@ def cleanup(jail_path):
         def _onerror(func, path, exc_info):
             exc_type, exc_value, exc_traceback = exc_info
 
+            if not issubclass(exc_type, FileNotFoundError):
+                raise exc_value
+
             if issubclass(exc_type, PermissionError):
                 # Update the file permissions with the immutable and
                 # append-only bit cleared
-                subprocess.run(['chattr', '-i', '-a', path])
+                subprocess.run(['chattr', '-i', '-a', path], stderr=subprocess.DEVNULL)
 
                 # Reattempt the removal
                 func(path)
-            elif not issubclass(exc_type, FileNotFoundError):
-                raise exc_value
 
         eprint(f'Cleaning up: {jail_path}.')
         shutil.rmtree(jail_path, onerror=_onerror)
@@ -1277,12 +1279,16 @@ def validate_sha256(file_path, digest):
     """
     Validates if a file matches a sha256 digest.
     """
+    file_hash = None
+
     try:
         with file_path.open('rb') as f:
             file_hash = hashlib.sha256(f.read()).hexdigest()
-            return file_hash == digest
     except FileNotFoundError:
         return False
+
+    return file_hash == digest
+
 
 def run_lxc_download_script(
     jail_name=None,
@@ -1291,10 +1297,15 @@ def run_lxc_download_script(
     distro=None,
     release=None
 ):
+    """
+    Fetches the Jip-Hop LXC download script and executes it to return a
+    list available images to create jails from.
+    """
     arch = 'amd64'
     lxc_dir = Path('.lxc')
     lxc_cache = lxc_dir / 'cache'
     lxc_download_script = lxc_dir / 'lxc-download.sh'
+    env_vars = {'LXC_CACHE_PATH': str(lxc_cache)}
 
     # Create the LXC directories when needed
     lxc_dir.mkdir(parents=True, exist_ok=True)
@@ -1312,10 +1323,7 @@ def run_lxc_download_script(
     # Get the LXC download script if not present locally (or when the
     # hash doesn't match)
     if not validate_sha256(lxc_download_script, DOWNLOAD_SCRIPT_DIGEST):
-        urllib.request.urlretrieve(
-            'https://raw.githubusercontent.com/Jip-Hop/lxc/b24d2d45b3875b013131b480e61c93b6fb8ea70c/templates/lxc-download.in',
-            lxc_download_script,
-        )
+        urllib.request.urlretrieve(DOWNLOAD_SCRIPT_URL, lxc_download_script)
 
         if not validate_sha256(lxc_download_script, DOWNLOAD_SCRIPT_DIGEST):
             eprint('Abort! Downloaded script has unexpected contents.')
@@ -1323,7 +1331,23 @@ def run_lxc_download_script(
 
     stat_chmod(lxc_download_script, 0o700)
 
-    if None not in [jail_name, jail_path, jail_rootfs_path, distro, release]:
+    if None in [jail_name, jail_path, jail_rootfs_path, distro, release]:
+        # List images
+        lxc_download = [lxc_download_script, '--list', f'--arch={arch}']
+        lxc_list = subprocess.Popen(lxc_download, stdout=subprocess.PIPE, env=env_vars)
+
+        for line in iter(lxc_list.stdout.readline, b''):
+            line = line.decode().strip()
+
+            # Filter out the known incompatible distros
+            exclude = r'^(alpine|amazonlinux|busybox|devuan|funtoo|openwrt|plamo|voidlinux)\s'
+
+            if not re.match(exclude, line):
+                print(line)
+
+        return lxc_list.wait()
+
+    try:
         lxc_download = [
             lxc_download_script,
             f'--name={jail_name}',
@@ -1333,29 +1357,10 @@ def run_lxc_download_script(
             f'--dist={distro}',
             f'--release={release}',
         ]
-
-        try:
-            subprocess.run(lxc_download, check=True, env={'LXC_CACHE_PATH': str(lxc_cache)})
-        except subprocess.CalledProcessError as e:
-            eprint('Aborting...')
-            return e.returncode
-    else:
-        # List images
-        lxc_download = [lxc_download_script, '--list', f'--arch={arch}']
-
-        p1 = subprocess.Popen(lxc_download, stdout=subprocess.PIPE, env={'LXC_CACHE_PATH': str(lxc_cache)})
-
-        for line in iter(p1.stdout.readline, b''):
-            line = line.decode().strip()
-
-            # Filter out the known incompatible distros
-            if not re.match(
-                r'^(alpine|amazonlinux|busybox|devuan|funtoo|openwrt|plamo|voidlinux)\s',
-                line,
-            ):
-                print(line)
-
-        return p1.wait()
+        subprocess.run(lxc_download, check=True, env=env_vars)
+    except subprocess.CalledProcessError as e:
+        eprint('Aborting...')
+        return e.returncode
 
     return 0
 
