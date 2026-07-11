@@ -580,7 +580,7 @@ def toggle_nvidia_drivers_setting(is_enable):
     time.sleep(1)
 
 
-def toggle_editable_sysext_filesystem(is_editable):
+def toggle_system_resources_dataset(is_editable):
     """
     Toggles the TrueNAS Unix System Resources (/usr) dataset to be
     editable or read-only.
@@ -646,7 +646,7 @@ def install_nvidia_proprietary_driver():
     # setting and uninstall the Open Kernel modules/driver
     uninstall_nvidia_modules()
     toggle_nvidia_drivers_setting(False)
-    toggle_editable_sysext_filesystem(True)
+    toggle_system_resources_dataset(True)
 
     is_installed = False
     installed_driver_file = get_nvidia_proprietary_driver_file()
@@ -676,7 +676,7 @@ def install_nvidia_proprietary_driver():
     # Re-enable the "Install NVIDIA Drivers" configuration setting to
     # automatically merge the system extensions, then install the
     # modules
-    toggle_editable_sysext_filesystem(False)
+    toggle_system_resources_dataset(False)
     toggle_nvidia_drivers_setting(True)
     install_nvidia_modules()
 
@@ -789,11 +789,11 @@ def passthrough_nvidia(
             print('Restoring the NVIDIA Open Kernel driver')
             uninstall_nvidia_modules()
             toggle_nvidia_drivers_setting(False)
-            toggle_editable_sysext_filesystem(True)
+            toggle_system_resources_dataset(True)
 
             shutil.move(backup_driver_file, get_nvidia_proprietary_driver_file())
 
-            toggle_editable_sysext_filesystem(False)
+            toggle_system_resources_dataset(False)
             toggle_nvidia_drivers_setting(True)
             install_nvidia_modules()
 
