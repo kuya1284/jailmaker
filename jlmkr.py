@@ -1013,7 +1013,7 @@ def add_hook(jail_path, systemd_run_additional_args, hook_command, hook_type):
     if not hook_file.exists() or hook_file.read_text() != hook_command:
         print(hook_command, file=hook_file.open('w'))
 
-    stat_chmod(hook_file, 0o700)
+    hook_file.chmod(0o700)
     systemd_run_additional_args += [f'--property={hook_type}={systemd_escape_path(hook_file)}']
 
 
@@ -1177,8 +1177,9 @@ def start_jail(jail_name):
             initial_setup_file.write(initial_setup)
 
         initial_setup_file_name = Path(initial_setup_file.name).name
+
         initial_setup_file_host_path = Path(initial_setup_file.name).resolve()
-        stat_chmod(initial_setup_file_host_path, 0o700)
+        initial_setup_file_host_path.chmod(0o700)
 
         print(f'About to run the initial setup script: {initial_setup_file_name}.')
         print('Waiting for networking in the jail to be ready.')
@@ -1309,10 +1310,10 @@ def run_lxc_download_script(
 
     # Create the LXC directories when needed
     lxc_dir.mkdir(parents=True, exist_ok=True)
-    stat_chmod(lxc_dir, 0o700)
+    lxc_dir.chmod(0o700)
 
     lxc_cache.mkdir(parents=True, exist_ok=True)
-    stat_chmod(lxc_cache, 0o700)
+    lxc_cache.chmod(0o700)
 
     try:
         if lxc_download_script.stat().st_uid != 0:
@@ -1329,7 +1330,7 @@ def run_lxc_download_script(
             eprint('Abort! Downloaded script has unexpected contents.')
             return 1
 
-    stat_chmod(lxc_download_script, 0o700)
+    lxc_download_script.chmod(0o700)
 
     if None in [jail_name, jail_path, jail_rootfs_path, distro, release]:
         # List images
@@ -1363,14 +1364,6 @@ def run_lxc_download_script(
         return e.returncode
 
     return 0
-
-
-def stat_chmod(file_path, mode):
-    """
-    Change mode if file doesn't already have this mode.
-    """
-    if mode != stat.S_IMODE(file_path.stat().st_mode):
-        file_path.chmod(mode)
 
 
 def agree(question, default=None):
@@ -1820,7 +1813,7 @@ def create_jail(**kwargs):
             else:
                 JAILS_DIR_PATH.mkdir(parents=True, exist_ok=True)
 
-            stat_chmod(JAILS_DIR_PATH, 0o700)
+            JAILS_DIR_PATH.chmod(0o700)
 
         # Creating a dataset for the jail if the jails dir is a dataset
         if get_zfs_dataset(JAILS_DIR_PATH):
@@ -2463,7 +2456,7 @@ def main():
 
     # Set appropriate permissions (if not already set) for this file,
     # since it's executed as root
-    stat_chmod(SCRIPT_PATH, 0o760)
+    SCRIPT_PATH.chmod(0o760)
 
     # Ignore all args after the first '--'
     args_to_parse = split_at_string(sys.argv[1:], '--')[0]
