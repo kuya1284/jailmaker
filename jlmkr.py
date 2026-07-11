@@ -912,7 +912,7 @@ def passthrough_nvidia(
     systemd_nspawn_additional_args += nvidia_mounts
 
 
-def exec_jail(jail_name, cmd):
+def exec_jail(jail_name, cmd, is_return_code=True):
     """
     Executes a command in the jail with given name.
     """
@@ -928,7 +928,17 @@ def exec_jail(jail_name, cmd):
         *cmd,
     ]
 
-    return subprocess.run(systemd_run, check=True)
+    try:
+        systemd_run = subprocess.run(systemd_run, check=True)
+    except subprocess.CalledProcessError as e:
+        if not is_return_code:
+            raise e
+
+        return e.returncode
+
+    return systemd_run.returncode if is_return_code else systemd_run
+
+
 
 
 def status_jail(jail_name, args):
@@ -1186,7 +1196,7 @@ def start_jail(jail_name):
         print('Please wait (this may take 90s in case of bridge networking with STP is enabled)...')
 
         try:
-            systemd_run = exec_jail(jail_name, [
+            systemd_run = [
                 '--',
                 'systemd-run',
                 f'--unit={initial_setup_file_name}',
@@ -1197,7 +1207,8 @@ def start_jail(jail_name):
                 '--property=After=network-online.target',
                 '--property=Wants=network-online.target',
                 f'/{initial_setup_file_name}',
-            ])
+            ]
+            systemd_run = exec_jail(jail_name, systemd_run, False)
         except subprocess.CalledProcessError as e:
             eprint('Tried to run the following commands inside the jail:')
             eprint(initial_setup)
@@ -2236,9 +2247,17 @@ def split_at_string(lst, string):
 
 def add_parser(subparser, **kwargs):
     # Always add help except for when explicitly disabled
-    add_help = kwargs.get('add_help', True)
+    is_add_help = kwargs.get('add_help', True)
 
-    # Never add help with the built-in add_help
+    # Commands to include the jail_name positional argument
+    is_add_jail_name_help = kwargs.pop('add_jail_name_help', False)
+    is_add_optional_jail_name_help = kwargs.pop('add_optional_jail_name_help', False)
+
+    # Commands having additional arguments after the jail name
+    is_split_args = kwargs.pop('split_args', False)
+
+    # Never add help with the built-in add_help because it'll be added
+    # below as needed
     kwargs['add_help'] = False
 
     kwargs['epilog'] = DISCLAIMER
@@ -2248,7 +2267,9 @@ def add_parser(subparser, **kwargs):
     parser = subparser.add_parser(**kwargs)
     parser.set_defaults(func=func)
 
-    if add_help:
+    parser.set_defaults(is_split_args=is_split_args)
+
+    if is_add_help:
         parser.add_argument(
             '-h',
             '--help',
@@ -2256,10 +2277,14 @@ def add_parser(subparser, **kwargs):
             action='store_true'
         )
 
+    if is_add_jail_name_help or is_add_optional_jail_name_help:
+        optional = '?' if is_add_optional_jail_name_help else None
+        parser.add_argument('jail_name', help='name of the jail', nargs=optional)
+
     # Setting the add_help after the parser has been created with
     # add_parser() has no effect, but it allows a lookup if this parser
     # has a help message available
-    parser.add_help = add_help
+    parser.add_help = is_add_help
 
     return parser
 
@@ -2283,16 +2308,21 @@ def main():
             'name': 'create',
             'help': 'create a new jail',
             'func': create_jail,
+            'add_optional_jail_name_help': True,
+            'split_args': True,
         },
         {
             'name': 'edit',
             'help': f'edit jail config with {get_text_editor()} text editor',
             'func': edit_jail,
+            'add_jail_name_help': True,
         },
         {
             'name': 'exec',
             'help': 'execute a command in the jail',
             'func': exec_jail,
+            'add_jail_name_help': True,
+            'split_args': True,
         },
         {
             'name': 'images',
@@ -2308,16 +2338,20 @@ def main():
             'name': 'log',
             'help': 'show jail log',
             'func': log_jail,
+            'add_jail_name_help': True,
+            'split_args': True,
         },
         {
             'name': 'remove',
             'help': 'remove previously created jail',
             'func': remove_jail,
+            'add_jail_name_help': True,
         },
         {
             'name': 'restart',
             'help': 'restart a running jail',
             'func': restart_jail,
+            'add_jail_name_help': True,
         },
         {
             'name': 'shell',
@@ -2329,6 +2363,7 @@ def main():
             'name': 'start',
             'help': 'start previously created jail',
             'func': start_jail,
+            'add_jail_name_help': True,
         },
         {
             'name': 'startup',
@@ -2339,31 +2374,28 @@ def main():
             'name': 'status',
             'help': 'show jail status',
             'func': status_jail,
+            'add_jail_name_help': True,
+            'split_args': True,
         },
         {
             'name': 'stop',
             'help': 'stop a running jail',
             'func': stop_jail,
+            'add_jail_name_help': True,
         },
     ]
 
-    split_commands = ['create', 'exec', 'log', 'status']
-    jail_name_commands = ['edit', 'exec', 'log', 'remove', 'restart', 'start', 'status', 'stop']
     commands = {}
 
     for definition in command_definitions:
         cmd = definition.get('name')
         commands[cmd] = add_parser(subparsers, **definition)
 
-    for cmd in jail_name_commands:
-        commands[cmd].add_argument('jail_name', help='name of the jail')
-
     commands['exec'].add_argument('cmd', nargs='*', help='command to execute')
     commands['shell'].add_argument('args', nargs='*', help='args to pass to machinectl shell')
     commands['log'].add_argument('args', nargs='*', help='args to pass to journalctl')
     commands['status'].add_argument('args', nargs='*', help='args to pass to systemctl')
 
-    commands['create'].add_argument('jail_name', nargs='?', help='name of the jail')
     commands['create'].add_argument('--distro')
     commands['create'].add_argument('--release')
     commands['create'].add_argument('--start', help='start jail after create', action='store_true')
@@ -2427,25 +2459,27 @@ def main():
 
             # Exit if a subparser wasn't invoked: jlmkr.py --help
             if args.get('help'):
-                need_help = True
+                is_print_help = True
                 command = args.get('command')
+                jail_name = args.get('jail_name')
+                is_split_args = args.get('is_split_args', False)
 
                 # Edge case for some commands
-                if command in split_commands and args['jail_name']:
+                if is_split_args and jail_name:
                     # Ignore all args after the jail name
-                    args_to_parse = split_at_string(args_to_parse, args['jail_name'])[0]
+                    args_to_parse = split_at_string(args_to_parse, jail_name)[0]
 
                     # Add back the jail_name as it may be a required
                     # positional to avoid the except clause below
-                    args_to_parse += [args['jail_name']]
+                    args_to_parse += [jail_name]
 
                     # Parse one more time...
                     args = vars(parser.parse_known_args(args_to_parse)[0])
 
                     # then check if help is still in the remaining args
-                    need_help = args.get('help')
+                    is_print_help = args.get('help')
 
-                if need_help:
+                if is_print_help:
                     commands[command].print_help()
                     sys.exit()
         except ExceptionWithParser as e:
@@ -2464,6 +2498,8 @@ def main():
     # systemd-run
     args = vars(parser.parse_known_args()[0])
     command = args.pop('command', None)
+    jail_name = args.get('jail_name')
+    is_split_args = args.get('is_split_args', False)
 
     # Start over with original args
     args_to_parse = sys.argv[1:]
@@ -2483,21 +2519,22 @@ def main():
         # Pass anything after the "shell" command to machinectl
         _, shell_args = split_at_string(args_to_parse, command)
         sys.exit(args['func'](shell_args))
-    elif command in split_commands and args['jail_name']:
-        jlmkr_args, remaining_args = split_at_string(args_to_parse, args['jail_name'])
+    elif is_split_args and jail_name:
+        jlmkr_args, remaining_args = split_at_string(args_to_parse, jail_name)
 
         if remaining_args and remaining_args[0] != '--':
             # Add '--' after the jail name to ensure further args, e.g.
             # --help or --version, are captured as
             # systemd_nspawn_user_args
-            args_to_parse = jlmkr_args + [args['jail_name'], '--'] + remaining_args
+            args_to_parse = jlmkr_args + [jail_name, '--'] + remaining_args
 
     # Parse args again, but show error for unknown args
     args = vars(parser.parse_args(args_to_parse))
 
     # Clean the args
     args.pop('help')
-    args.pop('command', None)
+    args.pop('command')
+    args.pop('is_split_args')
     func = args.pop('func')
 
     sys.exit(func(**args))
