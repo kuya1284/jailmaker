@@ -144,15 +144,13 @@ SHORTNAME = 'jlmkr'
 VERSION_GOLDEYE = '25.10'
 
 
-# Color are only needed for an interactive TTY
-if sys.stdout.isatty():
-    BOLD = '\033[1m'
-    RED = '\033[91m'
-    YELLOW = '\033[93m'
-    UNDERLINE = '\033[4m'
-    NORMAL = '\033[0m'
-else:
-    BOLD = RED = YELLOW = UNDERLINE = NORMAL = ''
+# Colors are only needed for an interactive TTY
+is_tty = sys.stdout.isatty()
+BOLD = '\033[1m' if is_tty else ''
+RED = '\033[91m' if is_tty else ''
+YELLOW = '\033[93m' if is_tty else ''
+UNDERLINE = '\033[4m' if is_tty else ''
+NORMAL = '\033[0m' if is_tty else ''
 
 DISCLAIMER = f"""{YELLOW}{BOLD}{__disclaimer__}{NORMAL}"""
 
@@ -293,15 +291,18 @@ class ExceptionWithParser(Exception):
         super().__init__(message)
 
 
-# Workaround for exit_on_error=False not applying to:
-# "error: the following arguments are required"
-# <https://github.com/python/cpython/issues/103498>
 class CustomSubParser(argparse.ArgumentParser):
+    """
+    Workaround for exit_on_error=False not applying to:
+    "error: the following arguments are required"
+
+    <https://github.com/python/cpython/issues/103498>
+    """
     def error(self, message):
-        if self.exit_on_error:
-            super().error(message)
-        else:
+        if not self.exit_on_error:
             raise ExceptionWithParser(self, message)
+
+        super().error(message)
 
 
 class Chroot:
@@ -371,15 +372,21 @@ def is_nvidia_open_driver_installed():
 
 def run_nvidia_smi_command(nvidia_smi_args, is_output=False):
     """
-    Runs the NVIDIA System Management Interface program, and optionally
-    returns STDOUT when needed.
+    Runs the NVIDIA System Management Interface program
 
     <https://docs.nvidia.com/deploy/nvidia-smi/index.html>
     """
-    smi = subprocess.run(['nvidia-smi'] + nvidia_smi_args, check=True, capture_output=is_output)
+    return subprocess.run(['nvidia-smi'] + nvidia_smi_args, check=True, capture_output=is_output)
 
-    if not is_output:
-        return smi
+
+def get_nvidia_smi_response(nvidia_smi_args):
+    """
+    Runs the NVIDIA System Management Interface program and returns
+    the response
+
+    <https://docs.nvidia.com/deploy/nvidia-smi/index.html>
+    """
+    smi = run_nvidia_smi_command(nvidia_smi_args, True)
 
     return smi.stdout.decode().strip()
 
@@ -468,13 +475,15 @@ def is_nvidia_proprietary_driver_required():
     if not is_nvidia_open_driver_installed():
         return False
 
+    compute_capability = None
+
     try:
         nvidia_smi_args = ['--query-gpu=compute_cap', '--format=csv,noheader']
-        compute_capability = run_nvidia_smi_command(nvidia_smi_args, True)
+        compute_capability = get_nvidia_smi_response(nvidia_smi_args)
     except subprocess.CalledProcessError as e:
         nvidia_fail(f'Failed to determine NVIDIA Compute Capability: {e}')
 
-    return float(compute_capability) < 7.5
+    return compute_capability and float(compute_capability) < 7.5
 
 
 def get_truenas_version():
@@ -688,17 +697,18 @@ def enable_nvidia_persistence_mode():
     """
     try:
         subprocess.run(['nvidia-persistenced'], check=True, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError as e:
-        # Was persistence mode previously enabled?
-        nvidia_smi_args = ['--query-gpu=persistence_mode', '--format=csv,noheader']
+    except subprocess.CalledProcessError as persistenced_error:
+        persistence_mode = None
 
         try:
-            persistence_mode = run_nvidia_smi_command(nvidia_smi_args, True)
-        except subprocess.CalledProcessError as e:
-            nvidia_fail(f'Failed to determine NVIDIA Persistence Mode status: {e}')
+            # Was persistence mode previously enabled?
+            nvidia_smi_args = ['--query-gpu=persistence_mode', '--format=csv,noheader']
+            persistence_mode = get_nvidia_smi_response(nvidia_smi_args)
+        except subprocess.CalledProcessError as smi_error:
+            nvidia_fail(f'Failed to determine NVIDIA Persistence Mode status: {smi_error}')
 
-        if 'Enabled' not in persistence_mode:
-            nvidia_fail(f'Failed to initialize "NVIDIA Persistence Mode": {e}')
+        if persistence_mode and 'Enabled' not in persistence_mode:
+            nvidia_fail(f'Failed to initialize "NVIDIA Persistence Mode": {persistenced_error}')
 
 
 def get_nvidia_driver_dependency_list(is_libraries=False):
@@ -878,11 +888,6 @@ def passthrough_nvidia(
     # Does the parent directory exist for config file?
     if not ld_config_file.parent.exists():
         nvidia_fail(f'ld.so.conf.d directory is missing inside "{jail_name}"')
-
-    # Only write if the config file doesn't yet exist or has different contents
-    existing_library_directories = set()
-    if ld_config_file.exists():
-        existing_library_directories.update(x for x in ld_config_file.read_text().splitlines() if x)
 
     if library_directories:
         print('\n'.join(x for x in library_directories), file=ld_config_file.open('w'))
@@ -2057,20 +2062,20 @@ def remove_jail(jail_name):
     # TODO: print that all zfs snapshots will be removed if jail has it's own zfs dataset
     check = input(f'\nCAUTION: Type "{jail_name}" to confirm jail deletion!\n\n')
 
-    if check == jail_name:
-        print()
-        jail_path = get_jail_path(jail_name)
-        returncode = stop_jail(jail_name)
-
-        if returncode != 0:
-            return returncode
-
-        print()
-        cleanup(jail_path)
-        return 0
-    else:
+    if check != jail_name:
         eprint('Wrong name, nothing happened.')
         return 1
+
+    print()
+    jail_path = get_jail_path(jail_name)
+    return_code = stop_jail(jail_name)
+
+    if return_code != 0:
+        return return_code
+
+    print()
+    cleanup(jail_path)
+    return 0
 
 
 def print_table(header, list_of_objects, empty_value_indicator):
