@@ -2235,13 +2235,11 @@ def split_at_string(lst, string):
 
 
 def add_parser(subparser, **kwargs):
-    if kwargs.get('add_help') is False:
-        # Don't add help if explicitly disabled
-        add_help = False
-    else:
-        # Never add help with the built-in add_help
-        kwargs['add_help'] = False
-        add_help = True
+    # Always add help except for when explicitly disabled
+    add_help = kwargs.get('add_help', True)
+
+    # Never add help with the built-in add_help
+    kwargs['add_help'] = False
 
     kwargs['epilog'] = DISCLAIMER
     kwargs['exit_on_error'] = False
@@ -2280,118 +2278,95 @@ def main():
         parser_class=CustomSubParser
     )
 
+    command_definitions = [
+        {
+            'name': 'create',
+            'help': 'create a new jail',
+            'func': create_jail,
+        },
+        {
+            'name': 'edit',
+            'help': f'edit jail config with {get_text_editor()} text editor',
+            'func': edit_jail,
+        },
+        {
+            'name': 'exec',
+            'help': 'execute a command in the jail',
+            'func': exec_jail,
+        },
+        {
+            'name': 'images',
+            'help': 'list available images to create jails from',
+            'func': run_lxc_download_script,
+        },
+        {
+            'name': 'list',
+            'help': 'list jails',
+            'func': list_jails,
+        },
+        {
+            'name': 'log',
+            'help': 'show jail log',
+            'func': log_jail,
+        },
+        {
+            'name': 'remove',
+            'help': 'remove previously created jail',
+            'func': remove_jail,
+        },
+        {
+            'name': 'restart',
+            'help': 'restart a running jail',
+            'func': restart_jail,
+        },
+        {
+            'name': 'shell',
+            'help': 'open shell in running jail (alias for machinectl shell)',
+            'func': shell_jail,
+            'add_help': False,
+        },
+        {
+            'name': 'start',
+            'help': 'start previously created jail',
+            'func': start_jail,
+        },
+        {
+            'name': 'startup',
+            'help': 'startup selected jails',
+            'func': startup_jails,
+        },
+        {
+            'name': 'status',
+            'help': 'show jail status',
+            'func': status_jail,
+        },
+        {
+            'name': 'stop',
+            'help': 'stop a running jail',
+            'func': stop_jail,
+        },
+    ]
+
     split_commands = ['create', 'exec', 'log', 'status']
+    jail_name_commands = ['edit', 'exec', 'log', 'remove', 'restart', 'start', 'status', 'stop']
     commands = {}
 
-    for d in [
-        dict(
-            name='create',
-            help='create a new jail',
-            func=create_jail,
-        ),
-        dict(
-            name='edit',
-            help=f'edit jail config with {get_text_editor()} text editor',
-            func=edit_jail,
-        ),
-        dict(
-            name='exec',
-            help='execute a command in the jail',
-            func=exec_jail,
-        ),
-        dict(
-            name='images',
-            help='list available images to create jails from',
-            func=run_lxc_download_script,
-        ),
-        dict(
-            name='list',
-            help='list jails',
-            func=list_jails,
-        ),
-        dict(
-            name='log',
-            help='show jail log',
-            func=log_jail,
-        ),
-        dict(
-            name='remove',
-            help='remove previously created jail',
-            func=remove_jail,
-        ),
-        dict(
-            name='restart',
-            help='restart a running jail',
-            func=restart_jail,
-        ),
-        dict(
-            name='shell',
-            help='open shell in running jail (alias for machinectl shell)',
-            func=shell_jail,
-            add_help=False,
-        ),
-        dict(
-            name='start',
-            help='start previously created jail',
-            func=start_jail,
-        ),
-        dict(
-            name='startup',
-            help='startup selected jails',
-            func=startup_jails,
-        ),
-        dict(
-            name='status',
-            help='show jail status',
-            func=status_jail,
-        ),
-        dict(
-            name='stop',
-            help='stop a running jail',
-            func=stop_jail,
-        ),
-    ]:
-        commands[d['name']] = add_parser(subparsers, **d)
+    for definition in command_definitions:
+        cmd = definition.get('name')
+        commands[cmd] = add_parser(subparsers, **definition)
 
-    for cmd in ['edit', 'exec', 'log', 'remove', 'restart', 'start', 'status', 'stop']:
+    for cmd in jail_name_commands:
         commands[cmd].add_argument('jail_name', help='name of the jail')
 
-    commands['exec'].add_argument(
-        'cmd',
-        nargs='*',
-        help='command to execute',
-    )
+    commands['exec'].add_argument('cmd', nargs='*', help='command to execute')
+    commands['shell'].add_argument('args', nargs='*', help='args to pass to machinectl shell')
+    commands['log'].add_argument('args', nargs='*', help='args to pass to journalctl')
+    commands['status'].add_argument('args', nargs='*', help='args to pass to systemctl')
 
-    commands['shell'].add_argument(
-        'args',
-        nargs='*',
-        help='args to pass to machinectl shell',
-    )
-
-    commands['log'].add_argument(
-        'args',
-        nargs='*',
-        help='args to pass to journalctl',
-    )
-
-    commands['status'].add_argument(
-        'args',
-        nargs='*',
-        help='args to pass to systemctl',
-    )
-
-    commands['create'].add_argument(
-        'jail_name',
-        nargs='?',
-        help='name of the jail',
-    )
+    commands['create'].add_argument('jail_name', nargs='?', help='name of the jail')
     commands['create'].add_argument('--distro')
     commands['create'].add_argument('--release')
-    commands['create'].add_argument(
-        '--start',
-        help='start jail after create',
-        action='store_true',
-    )
+    commands['create'].add_argument('--start', help='start jail after create', action='store_true')
     commands['create'].add_argument(
         '--startup',
         type=int,
@@ -2446,12 +2421,11 @@ def main():
 
     # Check for help
     if any(item in args_to_parse for item in ['-h', '--help']):
-        # Likely we need to show help output...
+        # More than Likely the help output needs to be shown...
         try:
             args = vars(parser.parse_known_args(args_to_parse)[0])
 
-            # We've exited by now if not invoking a subparser:
-            # jlmkr.py --help
+            # Exit if a subparser wasn't invoked: jlmkr.py --help
             if args.get('help'):
                 need_help = True
                 command = args.get('command')
@@ -2462,15 +2436,13 @@ def main():
                     args_to_parse = split_at_string(args_to_parse, args['jail_name'])[0]
 
                     # Add back the jail_name as it may be a required
-                    # positional and we don't want to end up in the
-                    # except clause below
+                    # positional to avoid the except clause below
                     args_to_parse += [args['jail_name']]
 
                     # Parse one more time...
                     args = vars(parser.parse_known_args(args_to_parse)[0])
 
-                    # ...and check if help is still in the remaining
-                    # args
+                    # then check if help is still in the remaining args
                     need_help = args.get('help')
 
                 if need_help:
@@ -2487,8 +2459,9 @@ def main():
     for command in commands:
         commands[command].exit_on_error = True
 
-    # Parse to find command and function and ignore unknown args which
-    # may be present such as args intended to passthrough to systemd-run
+    # Parse to find command and function and ignore unknown args, which
+    # may be present, such as args intended to pass through to
+    # systemd-run
     args = vars(parser.parse_known_args()[0])
     command = args.pop('command', None)
 
