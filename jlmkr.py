@@ -2256,6 +2256,9 @@ def add_parser(subparser, **kwargs):
     # Commands having additional arguments after the jail name
     is_split_args = kwargs.pop('split_args', False)
 
+    # Additional positional arguments
+    positional_args = kwargs.pop('positional_args', None)
+
     # Never add help with the built-in add_help because it'll be added
     # below as needed
     kwargs['add_help'] = False
@@ -2281,6 +2284,11 @@ def add_parser(subparser, **kwargs):
         optional = '?' if is_add_optional_jail_name_help else None
         parser.add_argument('jail_name', help='name of the jail', nargs=optional)
 
+    if positional_args:
+        for params in positional_args:
+            name_or_flags = params.pop('name_or_flags')
+            parser.add_argument(name_or_flags, **params)
+
     # Setting the add_help after the parser has been created with
     # add_parser() has no effect, but it allows a lookup if this parser
     # has a help message available
@@ -2289,13 +2297,7 @@ def add_parser(subparser, **kwargs):
     return parser
 
 
-def main():
-    if SCRIPT_PATH.stat().st_uid != 0:
-        fail(f'This script should be owned by the root user... Fix it manually with: `chown root {SCRIPT_PATH}`.')
-
-    parser = argparse.ArgumentParser(description=__doc__, epilog=DISCLAIMER, allow_abbrev=False)
-    parser.add_argument('--version', action='version', version=__version__)
-
+def init_commands(parser):
     subparsers = parser.add_subparsers(
         title='commands',
         dest='command',
@@ -2323,6 +2325,13 @@ def main():
             'func': exec_jail,
             'add_jail_name_help': True,
             'split_args': True,
+            'positional_args': [
+                {
+                    'name_or_flags': 'cmd',
+                    'nargs': '*',
+                    'help': 'command to execute'
+                },
+            ],
         },
         {
             'name': 'images',
@@ -2340,6 +2349,13 @@ def main():
             'func': log_jail,
             'add_jail_name_help': True,
             'split_args': True,
+            'positional_args': [
+                {
+                    'name_or_flags': 'args',
+                    'nargs': '*',
+                    'help': 'args to pass to journalctl'
+                },
+            ],
         },
         {
             'name': 'remove',
@@ -2358,6 +2374,13 @@ def main():
             'help': 'open shell in running jail (alias for machinectl shell)',
             'func': shell_jail,
             'add_help': False,
+            'positional_args': [
+                {
+                    'name_or_flags': 'args',
+                    'nargs': '*',
+                    'help': 'args to pass to machinectl shell'
+                },
+            ],
         },
         {
             'name': 'start',
@@ -2376,6 +2399,13 @@ def main():
             'func': status_jail,
             'add_jail_name_help': True,
             'split_args': True,
+            'positional_args': [
+                {
+                    'name_or_flags': 'args',
+                    'nargs': '*',
+                    'help': 'args to pass to systemctl'
+                },
+            ],
         },
         {
             'name': 'stop',
@@ -2388,13 +2418,8 @@ def main():
     commands = {}
 
     for definition in command_definitions:
-        cmd = definition.get('name')
-        commands[cmd] = add_parser(subparsers, **definition)
-
-    commands['exec'].add_argument('cmd', nargs='*', help='command to execute')
-    commands['shell'].add_argument('args', nargs='*', help='args to pass to machinectl shell')
-    commands['log'].add_argument('args', nargs='*', help='args to pass to journalctl')
-    commands['status'].add_argument('args', nargs='*', help='args to pass to systemctl')
+        command = definition.get('name')
+        commands[command] = add_parser(subparsers, **definition)
 
     commands['create'].add_argument('--distro')
     commands['create'].add_argument('--release')
@@ -2439,6 +2464,18 @@ def main():
         nargs='*',
         help='add additional systemd-nspawn flags',
     )
+
+    return commands
+
+
+def main():
+    if SCRIPT_PATH.stat().st_uid != 0:
+        fail(f'This script should be owned by the root user... Fix it manually with: `chown root {SCRIPT_PATH}`.')
+
+    parser = argparse.ArgumentParser(description=__doc__, epilog=DISCLAIMER, allow_abbrev=False)
+    parser.add_argument('--version', action='version', version=__version__)
+
+    commands = init_commands(parser)
 
     if os.getuid() != 0:
         parser.print_help()
@@ -2533,8 +2570,8 @@ def main():
 
     # Clean the args
     args.pop('help')
-    args.pop('command')
-    args.pop('is_split_args')
+    args.pop('command', None)
+    args.pop('is_split_args', None)
     func = args.pop('func')
 
     sys.exit(func(**args))
