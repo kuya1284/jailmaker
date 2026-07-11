@@ -14,7 +14,6 @@ IT COMES WITHOUT WARRANTY AND IS NOT SUPPORTED BY IXSYSTEMS."""
 
 import argparse
 import configparser
-import contextlib
 import hashlib
 import io
 import json
@@ -34,7 +33,7 @@ import urllib.request
 from collections import defaultdict
 from inspect import cleandoc
 from packaging.version import parse as parse_version
-from pathlib import Path, PurePath
+from pathlib import Path
 from textwrap import dedent
 
 DEFAULT_CONFIG = """startup=0
@@ -132,14 +131,13 @@ systemd_nspawn_default_args=--bind-ro=/sys/module
 # Always add --bind-ro=/sys/module to make lsmod happy
 # <https://manpages.debian.org/bookworm/manpages/sysfs.5.en.html>
 
-DOWNLOAD_SCRIPT_DIGEST = ('645ba65a8846a2f402fc8bd870029b95fbcd3128e3046cd55642d577652cb0a0')
+DOWNLOAD_SCRIPT_DIGEST = '645ba65a8846a2f402fc8bd870029b95fbcd3128e3046cd55642d577652cb0a0'
 MULTIARCH_ROOT_PATH = '/usr/lib/x86_64-linux-gnu'
 SYSEXT_PATH = '/usr/share/truenas/sysext-extensions'
-SCRIPT_PATH = os.path.realpath(__file__)
-SCRIPT_NAME = os.path.basename(SCRIPT_PATH)
-SCRIPT_DIR_PATH = os.path.dirname(SCRIPT_PATH)
-COMMAND_NAME = os.path.basename(__file__)
-JAILS_DIR_PATH = os.path.join(SCRIPT_DIR_PATH, 'jails')
+SCRIPT_PATH = Path(__file__).resolve()
+SCRIPT_NAME = SCRIPT_PATH.name
+SCRIPT_DIR_PATH = SCRIPT_PATH.parent
+JAILS_DIR_PATH = SCRIPT_DIR_PATH / 'jails'
 JAIL_CONFIG_NAME = 'config'
 JAIL_ROOTFS_NAME = 'rootfs'
 SHORTNAME = 'jlmkr'
@@ -314,7 +312,7 @@ class Chroot:
 
     def __enter__(self):
         self.old_root = os.open('/', os.O_PATH)
-        self.initial_cwd = os.path.abspath(os.getcwd())
+        self.initial_cwd = Path.cwd().absolute()
         os.chdir(self.new_root)
         os.chroot('.')
 
@@ -350,15 +348,15 @@ def nvidia_fail(error_msg):
 
 
 def get_jail_path(jail_name):
-    return os.path.join(JAILS_DIR_PATH, jail_name)
+    return JAILS_DIR_PATH / jail_name
 
 
 def get_jail_config_path(jail_name):
-    return os.path.join(get_jail_path(jail_name), JAIL_CONFIG_NAME)
+    return get_jail_path(jail_name) / JAIL_CONFIG_NAME
 
 
 def get_jail_rootfs_path(jail_name):
-    return os.path.join(get_jail_path(jail_name), JAIL_ROOTFS_NAME)
+    return get_jail_path(jail_name) /  JAIL_ROOTFS_NAME
 
 
 # Is the NVIDIA Open Kernel driver installed?
@@ -505,14 +503,13 @@ def delete_old_nvidia_open_driver_backups():
     sysext_dir = Path(SYSEXT_PATH)
 
     for back_up_file in list(sysext_dir.glob('nvidia-open-truenas*.raw')):
-        back_up_file = str(back_up_file)
-        ext_version = re.search(r'nvidia-open-truenas-([\d.]+).raw', back_up_file)
+        ext_version = re.search(r'nvidia-open-truenas-([\d.]+).raw', str(back_up_file))
         ext_version = ext_version.group(1) if ext_version else None
 
         if ext_version and parse_version(ext_version) == parse_version(get_truenas_version()):
             continue
 
-        os.remove(back_up_file)
+        back_up_file.unlink()
 
 
 def download_nvidia_proprietary_driver():
@@ -529,8 +526,8 @@ def download_nvidia_proprietary_driver():
     base_driver_url = 'https://truenas-drivers.zhouyou.info'
     driver_url = f'{base_driver_url}/{os_version}/nvidia.raw'
     checksum_url = f'{base_driver_url}/{os_version}/nvidia.raw.sha256'
-    driver_file = '/tmp/nvidia.raw'
-    checksum_file = '/tmp/nvidia.raw.sha256'
+    driver_file = Path('/tmp/nvidia.raw')
+    checksum_file = Path('/tmp/nvidia.raw.sha256')
 
     try:
         subprocess.run(['wget', '-q', driver_url, '-O', driver_file], check=True)
@@ -543,8 +540,8 @@ def download_nvidia_proprietary_driver():
         nvidia_fail('Failed to download the NVIDIA Proprietary driver checksum')
 
     # Validate hash to ensure a successful download
-    expected_checksum = Path(checksum_file).read_text().strip()
-    os.remove(checksum_file)
+    expected_checksum = checksum_file.read_text().strip()
+    checksum_file.unlink(missing_ok=True)
 
     if not validate_sha256(driver_file, expected_checksum):
         nvidia_fail('NVIDIA Proprietary driver is corrupt and must be downloaded again')
@@ -734,7 +731,9 @@ def passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_additional_args):
     if not is_gpu_passthrough_intel:
         return
 
-    if not os.path.exists('/dev/dri'):
+    dri_path = Path('/dev/dri')
+
+    if not dri_path.exists():
         eprint(dedent(
             """
             No intel GPU seems to be present...
@@ -744,7 +743,7 @@ def passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_additional_args):
 
         return
 
-    systemd_nspawn_additional_args.append('--bind=/dev/dri')
+    systemd_nspawn_additional_args.append(f'--bind={dri_path}')
 
 
 def passthrough_nvidia(
@@ -757,8 +756,7 @@ def passthrough_nvidia(
     Enables NVIDIA GPU passthrough from the host to the jail.
     """
     jail_rootfs_path = get_jail_rootfs_path(jail_name)
-    ld_config_file = f'etc/ld.so.conf.d/{SHORTNAME}-nvidia.conf'
-    ld_config_file = Path(os.path.join(jail_rootfs_path), ld_config_file)
+    ld_config_file = jail_rootfs_path / f'etc/ld.so.conf.d/{SHORTNAME}-nvidia.conf'
 
     # Forcefully disable the "force_nvidia_legacy_driver" setting for
     # TrueNAS CE versions older than Goldeye because the NVIDIA
@@ -772,8 +770,8 @@ def passthrough_nvidia(
         print('Deleting the dynamic libraries config file')
         ld_config_file.unlink(missing_ok=True)
 
-    # Should the the original NVIDIA Open Kernel driver be restored, if
-    # a backup of the driver exists?
+    # Should the original NVIDIA Open Kernel driver be restored, if a
+    # backup of the driver exists?
     if not (is_force_nvidia_legacy_driver or is_nvidia_proprietary_driver_required()):
         backup_driver_file = get_nvidia_open_driver_backup_file()
 
@@ -844,7 +842,7 @@ def passthrough_nvidia(
     library_directories = set()
 
     for file_path in nvidia_files:
-        if not os.path.exists(file_path):
+        if not Path(file_path).exists():
             # Exclude files that don't exist
             print(f"Skipped mounting {file_path}, it doesn't exist on the host...")
             continue
@@ -858,7 +856,7 @@ def passthrough_nvidia(
     # directory MUST NOT be bind mounted to avoid it from getting
     # clobbered in the jail
     for file_path in nvidia_libraries:
-        if not os.path.exists(file_path):
+        if not Path(file_path).exists():
             # Exclude files that don't exist
             print(f"Skipped mounting {file_path}, it doesn't exist on the host...")
             continue
@@ -953,18 +951,18 @@ def shell_jail(args):
 def parse_config_file(jail_config_path):
     config = KeyValueParser()
 
-    # Read default config to fallback to default values for keys not
+    # Read default config to fall back to default values for keys not
     # found in the jail_config_path file
     config.read_default_string(DEFAULT_CONFIG)
 
     try:
-        with open(jail_config_path, 'r') as fp:
+        with jail_config_path.open('r') as fp:
             config.read_file(fp)
-
-        return config
     except FileNotFoundError:
         eprint(f'Unable to find config file: {jail_config_path}')
-        return
+        return None
+
+    return config
 
 
 def systemd_escape_path(path):
@@ -974,7 +972,7 @@ def systemd_escape_path(path):
     <https://manpages.debian.org/bookworm/systemd/systemd.syntax.7.en.html#QUOTING>
     <https://manpages.debian.org/bookworm/systemd/systemd.service.5.en.html#COMMAND_LINES>
     """
-    path = map(lambda char: r'\s' if char == ' ' else '\\\\' if char == '\\' else char, path)
+    path = map(lambda char: r'\s' if char == ' ' else '\\\\' if char == '\\' else char, str(path))
 
     return ''.join(path)
 
@@ -989,11 +987,11 @@ def add_hook(jail_path, systemd_run_additional_args, hook_command, hook_type):
         return
 
     # Otherwise write a script file and call that
-    hook_file = os.path.abspath(os.path.join(jail_path, f'.{hook_type}'))
+    hook_file = (jail_path / f'.{hook_type}').resolve()
 
     # Only write if contents are different
-    if not os.path.exists(hook_file) or Path(hook_file).read_text() != hook_command:
-        print(hook_command, file=open(hook_file, 'w'))
+    if not hook_file.exists() or hook_file.read_text() != hook_command:
+        print(hook_command, file=hook_file.open('w'))
 
     stat_chmod(hook_file, 0o700)
     systemd_run_additional_args += [f'--property={hook_type}={systemd_escape_path(hook_file)}']
@@ -1102,11 +1100,11 @@ def start_jail(jail_name):
 
     # When there's no Machine ID, then this indicates that this is the
     # first time the jail is started
-    is_machine_id = os.path.exists(os.path.join(jail_rootfs_path, 'etc/machine-id'))
+    machine_id = jail_rootfs_path / 'etc/machine-id'
 
     # Only initialize "initial_setup" when creating a new jail (from a
     # config template)
-    if not is_machine_id and (initial_setup := config.my_get('initial_setup')):
+    if not machine_id.exists() and (initial_setup := config.my_get('initial_setup')):
         # Ensure the jail init system is ready before executing
         # everything in "initial_setup"
         systemd_nspawn_additional_args += ['--notify-ready=yes']
@@ -1137,7 +1135,7 @@ def start_jail(jail_name):
             f"""
             Failed to start jail {jail_name}...
             In case of a config error, you may fix it with:
-            {COMMAND_NAME} edit {jail_name}
+            {SCRIPT_NAME} edit {jail_name}
             """
         ))
 
@@ -1160,8 +1158,8 @@ def start_jail(jail_name):
             # Write a script file to call during initial setup
             initial_setup_file.write(initial_setup)
 
-        initial_setup_file_name = os.path.basename(initial_setup_file.name)
-        initial_setup_file_host_path = os.path.abspath(initial_setup_file.name)
+        initial_setup_file_name = Path(initial_setup_file.name).name
+        initial_setup_file_host_path = Path(initial_setup_file.name).resolve()
         stat_chmod(initial_setup_file_host_path, 0o700)
 
         print(f'About to run the initial setup script: {initial_setup_file_name}.')
@@ -1228,7 +1226,7 @@ def cleanup(jail_path):
     #
     # <https://github.com/python/cpython/issues/73885>
     # <https://stackoverflow.com/a/70549000>
-    if os.path.isdir(jail_path):
+    if jail_path.is_dir():
         def _onerror(func, path, exc_info):
             exc_type, exc_value, exc_traceback = exc_info
 
@@ -1263,7 +1261,7 @@ def validate_sha256(file_path, digest):
     Validates if a file matches a sha256 digest.
     """
     try:
-        with open(file_path, 'rb') as f:
+        with file_path.open('rb') as f:
             file_hash = hashlib.sha256(f.read()).hexdigest()
             return file_hash == digest
     except FileNotFoundError:
@@ -1277,19 +1275,20 @@ def run_lxc_download_script(
     release=None
 ):
     arch = 'amd64'
-    lxc_dir = '.lxc'
-    lxc_cache = os.path.join(lxc_dir, 'cache')
-    lxc_download_script = os.path.join(lxc_dir, 'lxc-download.sh')
+    lxc_dir = Path('.lxc')
+    lxc_cache = lxc_dir / 'cache'
+    lxc_download_script = lxc_dir / 'lxc-download.sh'
 
     # Create the LXC directories when needed
-    os.makedirs(lxc_dir, exist_ok=True)
+    lxc_dir.mkdir(parents=True, exist_ok=True)
     stat_chmod(lxc_dir, 0o700)
-    os.makedirs(lxc_cache, exist_ok=True)
+
+    lxc_cache.mkdir(parents=True, exist_ok=True)
     stat_chmod(lxc_cache, 0o700)
 
     try:
-        if os.stat(lxc_download_script).st_uid != 0:
-            os.remove(lxc_download_script)
+        if lxc_download_script.stat().st_uid != 0:
+            lxc_download_script.unlink()
     except FileNotFoundError:
         pass
 
@@ -1346,8 +1345,8 @@ def stat_chmod(file_path, mode):
     """
     Change mode if file doesn't already have this mode.
     """
-    if mode != stat.S_IMODE(os.stat(file_path).st_mode):
-        os.chmod(file_path, mode)
+    if mode != stat.S_IMODE(file_path.stat().st_mode):
+        file_path.chmod(mode)
 
 
 def agree(question, default=None):
@@ -1369,16 +1368,16 @@ def get_mount_point(path):
     """
     Return the mount point on which the given path resides.
     """
-    path = os.path.abspath(path)
+    path = path.resolve()
 
-    while not os.path.ismount(path):
-        path = os.path.dirname(path)
+    while not path.is_mount():
+        path = path.parent
 
     return path
 
 
 def get_relative_path_in_jailmaker_dir(absolute_path):
-    return PurePath(absolute_path).relative_to(SCRIPT_DIR_PATH)
+    return absolute_path.relative_to(SCRIPT_DIR_PATH)
 
 
 def get_zfs_dataset(path):
@@ -1391,14 +1390,20 @@ def get_zfs_dataset(path):
         # <https://github.com/openzfs/zfs/issues/11182>
         return field.replace('\\040', ' ')
 
-    path = os.path.realpath(path)
+    path = str(path.resolve())
+    mounts = Path('/proc/mounts')
 
-    with open('/proc/mounts', 'r') as f:
+    with mounts.open('r') as f:
         for line in f:
             fields = line.split()
+            relative_path = fields[0]
+            absolute_path = fields[1]
+            fs_type = fields[2]
 
-            if 'zfs' == fields[2] and path == clean_field(fields[1]):
-                return clean_field(fields[0])
+            if 'zfs' == fs_type and path == clean_field(absolute_path):
+                return clean_field(relative_path)
+
+    return ''
 
 
 def get_zfs_base_path():
@@ -1410,12 +1415,12 @@ def get_zfs_base_path():
     if not zfs_base_path:
         fail('Failed to get dataset path for Jailmaker directory.')
 
-    return zfs_base_path
+    return Path(zfs_base_path)
 
 
 def create_zfs_dataset(absolute_path):
     """
-    Create a ZFS Dataset inside the Jailmaker directory at the provided
+    Create a ZFS dataset inside the Jailmaker directory at the provided
     absolute path.
 
     Examples:
@@ -1423,7 +1428,7 @@ def create_zfs_dataset(absolute_path):
     - /mnt/mypool/jailmaker/jails/newjail
     """
     relative_path = get_relative_path_in_jailmaker_dir(absolute_path)
-    dataset_to_create = os.path.join(get_zfs_base_path(), relative_path)
+    dataset_to_create = get_zfs_base_path() / relative_path
 
     eprint(f'Creating ZFS Dataset "{dataset_to_create}"')
 
@@ -1432,13 +1437,13 @@ def create_zfs_dataset(absolute_path):
 
 def remove_zfs_dataset(absolute_path):
     """
-    Remove a ZFS Dataset inside the Jailmaker directory at the provided
+    Remove a ZFS dataset inside the Jailmaker directory at the provided
     absolute path.
 
     Example: /mnt/mypool/jailmaker/jails/oldjail
     """
     relative_path = get_relative_path_in_jailmaker_dir(absolute_path)
-    dataset_to_remove = os.path.join((get_zfs_base_path()), relative_path)
+    dataset_to_remove = get_zfs_base_path() / relative_path
 
     eprint(f'Removing ZFS Dataset "{dataset_to_remove}"')
 
@@ -1476,7 +1481,7 @@ def check_jail_name_available(jail_name, warn=True):
     """
     Return True if jail name is not yet taken.
     """
-    if not os.path.exists(get_jail_path(jail_name)):
+    if not get_jail_path(jail_name).exists():
         return True
 
     if warn:
@@ -1560,7 +1565,7 @@ def interactive_config():
                 {YELLOW}{BOLD}WARNING: ADVANCED USAGE{NORMAL}
 
                 You may now choose from a list which distro to install.
-                But not all of them may work with {COMMAND_NAME} since these images are made for LXC.
+                But not all of them may work with {SCRIPT_NAME} since these images are made for LXC.
                 Distros based on systemd probably work (e.g. Ubuntu, Arch Linux and Rocky Linux).
                 """
             ))
@@ -1660,7 +1665,7 @@ def interactive_config():
 
         print(dedent(
             f"""
-            The `{COMMAND_NAME} startup` command can automatically start a selection of jails.
+            The `{SCRIPT_NAME} startup` command can automatically start a selection of jails.
             This comes in handy when you want to automatically start multiple jails after booting TrueNAS CE (e.g. from a Post Init Script).
             """
         ))
@@ -1668,7 +1673,7 @@ def interactive_config():
         config.my_set(
             'startup',
             agree(
-                f'Do you want to start this jail when running: {COMMAND_NAME} startup?',
+                f'Do you want to start this jail when running: {SCRIPT_NAME} startup?',
                 'n'
             )
         )
@@ -1683,10 +1688,10 @@ def interactive_config():
 def create_jail(**kwargs):
     print(DISCLAIMER)
 
-    if os.path.basename(SCRIPT_DIR_PATH) != 'jailmaker':
+    if SCRIPT_DIR_PATH.name != 'jailmaker':
         eprint(dedent(
             f"""
-            {COMMAND_NAME} needs to create files.
+            {SCRIPT_NAME} needs to create files.
             Currently it can not decide if it is safe to create files in:
             {SCRIPT_DIR_PATH}
             Please create a dedicated dataset called "jailmaker", store {SCRIPT_NAME} there and try again.
@@ -1695,7 +1700,7 @@ def create_jail(**kwargs):
 
         return 1
 
-    if not PurePath(get_mount_point(SCRIPT_DIR_PATH)).is_relative_to('/mnt'):
+    if not get_mount_point(SCRIPT_DIR_PATH).is_relative_to('/mnt'):
         print(dedent(
             f"""
             {YELLOW}{BOLD}WARNING: BEWARE OF DATA LOSS{NORMAL}
@@ -1767,9 +1772,9 @@ def create_jail(**kwargs):
         if not user_overridden:
             print(dedent(
                 f"""
-                Hint: run `{COMMAND_NAME} create` without any arguments for interactive config.
+                Hint: run `{SCRIPT_NAME} create` without any arguments for interactive config.
                 Or use CLI args to override the default options.
-                For more info, run: `{COMMAND_NAME} create --help`
+                For more info, run: `{SCRIPT_NAME} create --help`
                 """
             ))
     else:
@@ -1783,12 +1788,13 @@ def create_jail(**kwargs):
     # otherwise the wrong directory may be affected
     try:
         # Create the dir or dataset where to store the jails
-        if not os.path.exists(JAILS_DIR_PATH):
+        if not JAILS_DIR_PATH.exists():
             if get_zfs_dataset(SCRIPT_DIR_PATH):
-                # Creating "jails" dataset if "jailmaker" is a ZFS Dataset
+                # Creating "jails" dataset if "jailmaker" is a ZFS
+                # dataset
                 create_zfs_dataset(JAILS_DIR_PATH)
             else:
-                os.makedirs(JAILS_DIR_PATH, exist_ok=True)
+                JAILS_DIR_PATH.mkdir(parents=True, exist_ok=True)
 
             stat_chmod(JAILS_DIR_PATH, 0o700)
 
@@ -1800,11 +1806,12 @@ def create_jail(**kwargs):
         jail_rootfs_path = get_jail_rootfs_path(jail_name)
 
         # Create directory for rootfs
-        os.makedirs(jail_rootfs_path, exist_ok=True)
+        jail_rootfs_path.mkdir(parents=True, exist_ok=True)
 
-        # LXC download script needs to write to this file during install
-        # but we don't need it so we will remove it later
-        open(jail_config_path, 'a').close()
+        # LXC download script needs to write to this file during
+        # installation; however, it will be removed later because it
+        # isn't needed
+        jail_config_path.open('a').close()
 
         if (
             returncode := run_lxc_download_script(
@@ -1841,9 +1848,9 @@ def create_jail(**kwargs):
         # But alpine jails made with Jailmaker have other issues, such
         # as not shutting down cleanly via systemctl and machinectl.
 
+        # Use chroot to correctly resolve absolute /sbin/init symlink
         with Chroot(jail_rootfs_path):
-            # Use chroot to correctly resolve absolute /sbin/init symlink
-            init_system_name = os.path.basename(os.path.realpath('/sbin/init'))
+            init_system_name = Path('/sbin/init').resolve().name
 
         if (init_system_name != 'systemd'
             and parse_os_release(jail_rootfs_path).get('ID') != 'nixos'
@@ -1863,7 +1870,7 @@ def create_jail(**kwargs):
                 Read about the downsides of nsenter:
                 https://github.com/systemd/systemd/issues/12785#issuecomment-503019081
 
-                {BOLD}Using this distro with {COMMAND_NAME} is NOT recommended.{NORMAL}
+                {BOLD}Using this distro with {SCRIPT_NAME} is NOT recommended.{NORMAL}
                 """
             ))
 
@@ -1872,33 +1879,25 @@ def create_jail(**kwargs):
             config.my_set('startup', 0)
             start_now = False
 
-        # Remove config which systemd handles for us
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(os.path.join(jail_rootfs_path, 'etc/machine-id'))
-        with contextlib.suppress(FileNotFoundError):
-            os.remove(os.path.join(jail_rootfs_path, 'etc/resolv.conf'))
+        # Remove config files created by systemd
+        (jail_rootfs_path / 'etc/machine-id').unlink(missing_ok=True)
+        (jail_rootfs_path / 'etc/resolv.conf').unlink(missing_ok=True)
 
         # Prevent root login failures when logging in with Secure TTY
         #
         # <https://github.com/systemd/systemd/issues/852>
-        print(
-            '\n'.join([f'pts/{i}' for i in range(0, 11)]),
-            file=open(os.path.join(jail_rootfs_path, 'etc/securetty'), 'w'),
-        )
+        terminal_devices = '\n'.join([f'pts/{i}' for i in range(0, 11)])
 
-        network_dir_path = os.path.join(jail_rootfs_path, 'etc/systemd/network')
+        print(terminal_devices, file=(jail_rootfs_path / 'etc/securetty').open('w'))
+
+        network_dir_path = jail_rootfs_path / 'etc/systemd/network'
 
         # Modify default network settings, if network_dir_path exists
-        if os.path.isdir(network_dir_path):
-            default_host0_network_file = os.path.join(
-                jail_rootfs_path,
-                'lib/systemd/network/80-container-host0.network'
-            )
+        if network_dir_path.is_dir():
+            host0_network_file = jail_rootfs_path / 'lib/systemd/network/80-container-host0.network'
 
             # Check if default host0 network file exists
-            if os.path.isfile(default_host0_network_file):
-                override_network_file = os.path.join(network_dir_path, '80-container-host0.network')
-
+            if host0_network_file.is_file():
                 # Override the default 80-container-host0.network file
                 # (by using the same name). This config applies when
                 # using the --network-bridge option of systemd-nspawn
@@ -1906,78 +1905,73 @@ def create_jail(**kwargs):
                 # container won't get IP address via DHCP, but keep it
                 # enabled on IPv6, as SLAAC and DHCPv6 both require a
                 # local-link address to function
-                print(
-                    Path(default_host0_network_file)
-                    .read_text()
-                    .replace('LinkLocalAddressing=yes', 'LinkLocalAddressing=ipv6'),
-                    file=open(override_network_file, 'w'),
-                )
+                host0 = host0_network_file.read_text()
+                host0 = host0.replace('LinkLocalAddressing=yes', 'LinkLocalAddressing=ipv6')
+
+                print(host0, file=(network_dir_path / '80-container-host0.network').open('w'))
 
             # Setup DHCP for MACVLAN network interfaces. This config
             # applies when using the --network-macvlan option of
             # systemd-nspawn.
             #
             # <https://www.debian.org/doc/manuals/debian-reference/ch05.en.html#_the_modern_network_configuration_without_gui>
-            print(
-                cleandoc(
-                    """
-                    [Match]
-                    Virtualization=container
-                    Name=mv-*
+            macvlan_settings = cleandoc(
+                """
+                [Match]
+                Virtualization=container
+                Name=mv-*
 
-                    [Network]
-                    DHCP=yes
-                    LinkLocalAddressing=ipv6
+                [Network]
+                DHCP=yes
+                LinkLocalAddressing=ipv6
 
-                    [DHCPv4]
-                    UseDNS=true
-                    UseTimezone=true
-                    """
-                ),
-                file=open(os.path.join(network_dir_path, 'mv-dhcp.network'), 'w'),
+                [DHCPv4]
+                UseDNS=true
+                UseTimezone=true
+                """
             )
+
+            print(macvlan_settings, file=(network_dir_path / 'mv-dhcp.network').open('w'))
 
             # Setup DHCP for veth-extra network interfaces. This config
             # applies when using the --network-veth-extra option of
             # systemd-nspawn.
             #
             # <https://www.debian.org/doc/manuals/debian-reference/ch05.en.html#_the_modern_network_configuration_without_gui>
-            print(
-                cleandoc(
-                    """
-                    [Match]
-                    Virtualization=container
-                    Name=vee-*
+            veth_extra_settings = cleandoc(
+                """
+                [Match]
+                Virtualization=container
+                Name=vee-*
 
-                    [Network]
-                    DHCP=yes
-                    LinkLocalAddressing=ipv6
+                [Network]
+                DHCP=yes
+                LinkLocalAddressing=ipv6
 
-                    [DHCPv4]
-                    UseDNS=true
-                    UseTimezone=true
-                    """
-                ),
-                file=open(os.path.join(network_dir_path, 'vee-dhcp.network'), 'w'),
+                [DHCPv4]
+                UseDNS=true
+                UseTimezone=true
+                """
             )
+
+            print(veth_extra_settings, file=(network_dir_path / 'vee-dhcp.network').open('w'))
 
             # Override preset which caused systemd-networkd to be
             # disabled (e.g. Fedora 39)
             #
             # <https://www.freedesktop.org/software/systemd/man/latest/systemd.preset.html>
             # <https://github.com/lxc/lxc-ci/blob/f632823ecd9b258ed42df40449ec54ed7ef8e77d/images/fedora.yaml#L312C5-L312C38>
-            preset_path = os.path.join(jail_rootfs_path, 'etc/systemd/system-preset')
-            os.makedirs(preset_path, exist_ok=True)
+            preset_path = jail_rootfs_path / 'etc/systemd/system-preset'
+            preset_path.mkdir(parents=True, exist_ok=True)
 
-            print(
-                'enable systemd-networkd.service',
-                file=open(os.path.join(preset_path, '00-jailmaker.preset'), 'w'),
-            )
+            preset_file = preset_path / '00-jailmaker.preset'
 
-        with open(jail_config_path, 'w') as fp:
+            print('enable systemd-networkd.service', file=preset_file.open('w'))
+
+        with jail_config_path.open('w') as fp:
             config.write(fp)
 
-        os.chmod(jail_config_path, 0o600)
+        jail_config_path.chmod(0o600)
     except BaseException as error:
         # Clean up on any exception and rethrow
         cleanup(jail_path)
@@ -2114,7 +2108,7 @@ def run_command_and_parse_json(command):
 
 def get_all_jail_names():
     try:
-        jail_names = os.listdir(JAILS_DIR_PATH)
+        jail_names = [jail_dir.name for jail_dir in JAILS_DIR_PATH.iterdir()]
     except FileNotFoundError:
         jail_names = []
 
@@ -2128,7 +2122,7 @@ def parse_os_release(new_root):
         # Use chroot to correctly resolve os-release symlink (for nixos)
         for candidate in ['/etc/os-release', '/usr/lib/os-release']:
             try:
-                with open(candidate, encoding='utf-8') as f:
+                with Path(candidate).open(encoding='utf-8') as f:
                     # TODO: Is there a solution which doesn't depend on the internal _parse_os_release method?
                     result = platform._parse_os_release(f)
                     break
@@ -2272,7 +2266,7 @@ def add_parser(subparser, **kwargs):
 
 
 def main():
-    if os.stat(SCRIPT_PATH).st_uid != 0:
+    if SCRIPT_PATH.stat().st_uid != 0:
         fail(f'This script should be owned by the root user... Fix it manually with: `chown root {SCRIPT_PATH}`.')
 
     parser = argparse.ArgumentParser(description=__doc__, epilog=DISCLAIMER, allow_abbrev=False)
