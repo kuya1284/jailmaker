@@ -23,7 +23,6 @@ import re
 import readline
 import shlex
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -2249,10 +2248,6 @@ def add_parser(subparser, **kwargs):
     # Always add help except for when explicitly disabled
     is_add_help = kwargs.get('add_help', True)
 
-    # Commands to include the jail_name positional argument
-    is_add_jail_name_help = kwargs.pop('add_jail_name_help', False)
-    is_add_optional_jail_name_help = kwargs.pop('add_optional_jail_name_help', False)
-
     # Commands having additional arguments after the jail name
     is_split_args = kwargs.pop('split_args', False)
 
@@ -2280,10 +2275,6 @@ def add_parser(subparser, **kwargs):
             action='store_true'
         )
 
-    if is_add_jail_name_help or is_add_optional_jail_name_help:
-        optional = '?' if is_add_optional_jail_name_help else None
-        parser.add_argument('jail_name', help='name of the jail', nargs=optional)
-
     if positional_args:
         for params in positional_args:
             name_or_flags = params.pop('name_or_flags')
@@ -2305,27 +2296,32 @@ def init_commands(parser):
         parser_class=CustomSubParser
     )
 
+    jail_name_help = {
+        'name_or_flags': 'jail_name',
+        'help': 'name of the jail'
+    }
+
     command_definitions = [
         {
             'name': 'create',
             'help': 'create a new jail',
             'func': create_jail,
-            'add_optional_jail_name_help': True,
             'split_args': True,
+            'positional_args': [jail_name_help | {'nargs': '?'}],
         },
         {
             'name': 'edit',
             'help': f'edit jail config with {get_text_editor()} text editor',
             'func': edit_jail,
-            'add_jail_name_help': True,
+            'positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'exec',
             'help': 'execute a command in the jail',
             'func': exec_jail,
-            'add_jail_name_help': True,
             'split_args': True,
             'positional_args': [
+                jail_name_help.copy(),
                 {
                     'name_or_flags': 'cmd',
                     'nargs': '*',
@@ -2347,9 +2343,9 @@ def init_commands(parser):
             'name': 'log',
             'help': 'show jail log',
             'func': log_jail,
-            'add_jail_name_help': True,
             'split_args': True,
             'positional_args': [
+                jail_name_help.copy(),
                 {
                     'name_or_flags': 'args',
                     'nargs': '*',
@@ -2361,13 +2357,13 @@ def init_commands(parser):
             'name': 'remove',
             'help': 'remove previously created jail',
             'func': remove_jail,
-            'add_jail_name_help': True,
+            'positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'restart',
             'help': 'restart a running jail',
             'func': restart_jail,
-            'add_jail_name_help': True,
+            'positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'shell',
@@ -2386,7 +2382,7 @@ def init_commands(parser):
             'name': 'start',
             'help': 'start previously created jail',
             'func': start_jail,
-            'add_jail_name_help': True,
+            'positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'startup',
@@ -2397,9 +2393,9 @@ def init_commands(parser):
             'name': 'status',
             'help': 'show jail status',
             'func': status_jail,
-            'add_jail_name_help': True,
             'split_args': True,
             'positional_args': [
+                jail_name_help.copy(),
                 {
                     'name_or_flags': 'args',
                     'nargs': '*',
@@ -2411,7 +2407,7 @@ def init_commands(parser):
             'name': 'stop',
             'help': 'stop a running jail',
             'func': stop_jail,
-            'add_jail_name_help': True,
+            'positional_args': [jail_name_help.copy()],
         },
     ]
 
