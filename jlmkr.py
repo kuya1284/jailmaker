@@ -1545,7 +1545,74 @@ def get_text_editor():
     )
 
 
-def interactive_config():
+def non_interactive_create(jail_name, create_options):
+    if not check_jail_name_valid(jail_name):
+        return None, None
+
+    if not check_jail_name_available(jail_name):
+        return None, None
+
+    is_start_now = create_options.pop('start', False)
+    jail_config_path = create_options.pop('config')
+
+    config = KeyValueParser()
+
+    if jail_config_path:
+        # TODO: fallback to default values for e.g. distro and release if they are not in the config file
+        if jail_config_path == '-':
+            print(f'Creating jail {jail_name} from config template passed via stdin.')
+            config.read_string(sys.stdin.read())
+        else:
+            print(f'Creating jail {jail_name} from config template {jail_config_path}.')
+
+            if jail_config_path not in config.read(jail_config_path):
+                eprint(f'Failed to read config template {jail_config_path}.')
+                return None, None
+    else:
+        print(f'Creating jail {jail_name} with default config.')
+        config.read_string(DEFAULT_CONFIG)
+
+    is_user_override = False
+
+    options = [
+        'distro',
+        'gpu_passthrough_intel',
+        'gpu_passthrough_nvidia',
+        'force_nvidia_legacy_driver',
+        'release',
+        'seccomp',
+        'startup',
+        'systemd_nspawn_user_args',
+    ]
+
+    for option in options:
+        value = create_options.pop(option)
+
+        if (value is not None
+            and value is not config.my_get(option, None)
+
+            # String, non-empty list of args or int
+            and (isinstance(value, int) or len(value))
+        ):
+            # TODO: this will wipe all systemd_nspawn_user_args from the template... Should there be an option to append them instead?
+            print(f'Overriding {option} config value with {value}.')
+
+            config.my_set(option, value)
+            is_user_override = True
+
+    if not is_user_override:
+        print(dedent(
+            f"""
+            Hint: run `{SCRIPT_NAME} create` without any arguments for interactive config.
+            Or use CLI args to override the default options.
+            For more info, run: `{SCRIPT_NAME} create --help`
+            """
+        ))
+
+    return config, is_start_now
+
+
+def interactive_create():
     config = KeyValueParser()
     config.read_string(DEFAULT_CONFIG)
 
@@ -1711,6 +1778,17 @@ def interactive_config():
     return jail_name, config, is_start_now
 
 
+def get_create_data(create_options):
+    jail_name = create_options.pop('jail_name', None)
+
+    if not jail_name:
+        return interactive_create()
+
+    config, is_start_now = non_interactive_create(jail_name, create_options)
+
+    return jail_name, config, is_start_now
+
+
 def get_jail_os_info(jail_name):
     os_info = {}
 
@@ -1729,7 +1807,7 @@ def get_jail_os_info(jail_name):
     return os_info
 
 
-def create_jail(**kwargs):
+def create_jail(**create_options):
     print(DISCLAIMER)
 
     if SCRIPT_DIR_PATH.name != 'jailmaker':
@@ -1756,74 +1834,10 @@ def create_jail(**kwargs):
             """
         ))
 
-    jail_name = kwargs.pop('jail_name', None)
-    is_start_now = False
+    jail_name, config, is_start_now = get_create_data(create_options)
 
-    # Non-interactive create
-    if jail_name:
-        if not check_jail_name_valid(jail_name):
-            return 1
-
-        if not check_jail_name_available(jail_name):
-            return 1
-
-        is_start_now = kwargs.pop('start', is_start_now)
-        jail_config_path = kwargs.pop('config')
-
-        config = KeyValueParser()
-
-        if jail_config_path:
-            # TODO: fallback to default values for e.g. distro and release if they are not in the config file
-            if jail_config_path == '-':
-                print(f'Creating jail {jail_name} from config template passed via stdin.')
-                config.read_string(sys.stdin.read())
-            else:
-                print(f'Creating jail {jail_name} from config template {jail_config_path}.')
-
-                if jail_config_path not in config.read(jail_config_path):
-                    eprint(f'Failed to read config template {jail_config_path}.')
-                    return 1
-        else:
-            print(f'Creating jail {jail_name} with default config.')
-            config.read_string(DEFAULT_CONFIG)
-
-        is_user_override = False
-        options = [
-            'distro',
-            'gpu_passthrough_intel',
-            'gpu_passthrough_nvidia',
-            'force_nvidia_legacy_driver',
-            'release',
-            'seccomp',
-            'startup',
-            'systemd_nspawn_user_args',
-        ]
-
-        for option in options:
-            value = kwargs.pop(option)
-
-            if (
-                value is not None
-                # String, non-empty list of args or int
-                and (isinstance(value, int) or len(value))
-                and value is not config.my_get(option, None)
-            ):
-                # TODO: this will wipe all systemd_nspawn_user_args from the template...
-                # Should there be an option to append them instead?
-                print(f'Overriding {option} config value with {value}.')
-                config.my_set(option, value)
-                is_user_override = True
-
-        if not is_user_override:
-            print(dedent(
-                f"""
-                Hint: run `{SCRIPT_NAME} create` without any arguments for interactive config.
-                Or use CLI args to override the default options.
-                For more info, run: `{SCRIPT_NAME} create --help`
-                """
-            ))
-    else:
-        jail_name, config, is_start_now = interactive_config()
+    if config is None:
+        return 1
 
     jail_path = get_jail_path(jail_name)
     distro = config.my_get('distro')
