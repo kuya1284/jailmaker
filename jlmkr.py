@@ -1449,6 +1449,7 @@ def create_zfs_dataset(absolute_path):
 
     eprint(f'Creating ZFS Dataset "{dataset_to_create}"')
 
+    # subprocess.CalledProcessError will be caught by create_jail()
     subprocess.run(['zfs', 'create', dataset_to_create], check=True)
 
 
@@ -1464,58 +1465,55 @@ def remove_zfs_dataset(absolute_path):
 
     eprint(f'Removing ZFS Dataset "{dataset_to_remove}"')
 
+    # subprocess.CalledProcessError will be caught by create_jail()
     subprocess.run(['zfs', 'destroy', '-r', dataset_to_remove], check=True)
 
 
-def check_jail_name_valid(jail_name, warn=True):
+def check_jail_name_valid(name):
     """
-    Return True if jail name matches the required format.
+    Confirms that the jail name matches the required format.
     """
-    if (
-        re.match(r'^[.a-zA-Z0-9-]{1,64}$', jail_name)
-        and not jail_name.startswith('.')
-        and '..' not in jail_name
-    ):
+    if re.match(r'^[.a-zA-Z0-9-]{1,64}$', name) and not name.startswith('.') and '..' not in name:
         return True
 
-    if warn:
-        eprint(dedent(
-            f"""
-            {YELLOW}{BOLD}WARNING: INVALID NAME{NORMAL}
+    eprint(dedent(
+        f"""
+        {YELLOW}{BOLD}WARNING: INVALID NAME{NORMAL}
 
-            A valid name consists of:
-            - allowed characters (alphanumeric, dash, dot)
-            - no leading or trailing dots
-            - no sequences of multiple dots
-            - max 64 characters
-            """
-        ))
+        A valid name consists of:
+        - allowed characters (alphanumeric, dash, dot)
+        - no leading or trailing dots
+        - no sequences of multiple dots
+        - max 64 characters
+        """
+    ))
 
     return False
 
 
-def check_jail_name_available(jail_name, warn=True):
+def check_jail_name_available(name, warn=True):
     """
-    Return True if jail name is not yet taken.
+    Confirms if a jail name is available for use.
     """
-    if not get_jail_path(jail_name).exists():
+    if not get_jail_path(name).exists():
         return True
 
     if warn:
         print()
-        eprint('A jail with this name already exists.')
+        eprint(f'A jail with this name, "{name}", already exists.')
 
     return False
 
 
-def ask_jail_name(jail_name=""):
+def ask_jail_name(name=''):
     while True:
         print()
-        jail_name = input_with_default('Enter jail name: ', jail_name).strip()
+        name = input_with_default('Enter jail name: ', name).strip()
 
-        if check_jail_name_valid(jail_name):
-            if check_jail_name_available(jail_name):
-                return jail_name
+        if not (check_jail_name_valid(name) and check_jail_name_available(name)):
+            continue
+
+        return name
 
 
 def agree_with_default(config, key, question):
@@ -1696,10 +1694,10 @@ def interactive_config():
         )
 
     print()
-    start_now = agree('Do you want to start this jail now (when create is done)?', 'y')
+    is_start_now = agree('Do you want to start this jail now (when create is done)?', 'y')
     print()
 
-    return jail_name, config, start_now
+    return jail_name, config, is_start_now
 
 
 def create_jail(**kwargs):
@@ -1730,7 +1728,7 @@ def create_jail(**kwargs):
         ))
 
     jail_name = kwargs.pop('jail_name', None)
-    start_now = False
+    is_start_now = False
 
     # Non-interactive create
     if jail_name:
@@ -1740,7 +1738,7 @@ def create_jail(**kwargs):
         if not check_jail_name_available(jail_name):
             return 1
 
-        start_now = kwargs.pop('start', start_now)
+        is_start_now = kwargs.pop('start', is_start_now)
         jail_config_path = kwargs.pop('config')
 
         config = KeyValueParser()
@@ -1760,9 +1758,8 @@ def create_jail(**kwargs):
             print(f'Creating jail {jail_name} with default config.')
             config.read_string(DEFAULT_CONFIG)
 
-        user_overridden = False
-
-        for option in [
+        is_user_override = False
+        options = [
             'distro',
             'gpu_passthrough_intel',
             'gpu_passthrough_nvidia',
@@ -1771,7 +1768,9 @@ def create_jail(**kwargs):
             'seccomp',
             'startup',
             'systemd_nspawn_user_args',
-        ]:
+        ]
+
+        for option in options:
             value = kwargs.pop(option)
 
             if (
@@ -1784,9 +1783,9 @@ def create_jail(**kwargs):
                 # Should there be an option to append them instead?
                 print(f'Overriding {option} config value with {value}.')
                 config.my_set(option, value)
-                user_overridden = True
+                is_user_override = True
 
-        if not user_overridden:
+        if not is_user_override:
             print(dedent(
                 f"""
                 Hint: run `{SCRIPT_NAME} create` without any arguments for interactive config.
@@ -1795,7 +1794,7 @@ def create_jail(**kwargs):
                 """
             ))
     else:
-        jail_name, config, start_now = interactive_config()
+        jail_name, config, is_start_now = interactive_config()
 
     jail_path = get_jail_path(jail_name)
     distro = config.my_get('distro')
@@ -1830,14 +1829,11 @@ def create_jail(**kwargs):
         # isn't needed
         jail_config_path.open('a').close()
 
-        if (
-            returncode := run_lxc_download_script(
-                jail_name, jail_path, jail_rootfs_path, distro, release
-            )
-            != 0
-        ):
+        code = run_lxc_download_script(jail_name, jail_path, jail_rootfs_path, distro, release)
+
+        if code != 0:
             cleanup(jail_path)
-            return returncode
+            return code
 
         # Assuming the name of the jail is "myjail" and the command
         # "machinectl shell myjail" fails, try the following:
@@ -1867,11 +1863,9 @@ def create_jail(**kwargs):
 
         # Use chroot to correctly resolve absolute /sbin/init symlink
         with Chroot(jail_rootfs_path):
-            init_system_name = Path('/sbin/init').resolve().name
+            system_name = Path('/sbin/init').resolve().name
 
-        if (init_system_name != 'systemd'
-            and parse_os_release(jail_rootfs_path).get('ID') != 'nixos'
-        ):
+        if system_name != 'systemd' and parse_os_release(jail_rootfs_path).get('ID') != 'nixos':
             print(dedent(
                 f"""
                 {YELLOW}{BOLD}WARNING: DISTRO NOT SUPPORTED{NORMAL}
@@ -1894,7 +1888,7 @@ def create_jail(**kwargs):
             print('Autostart has been disabled.')
             print('You need to start this jail manually.')
             config.my_set('startup', 0)
-            start_now = False
+            is_start_now = False
 
         # Remove config files created by systemd
         (jail_rootfs_path / 'etc/machine-id').unlink(missing_ok=True)
@@ -1904,7 +1898,6 @@ def create_jail(**kwargs):
         #
         # <https://github.com/systemd/systemd/issues/852>
         terminal_devices = '\n'.join([f'pts/{i}' for i in range(0, 11)])
-
         print(terminal_devices, file=(jail_rootfs_path / 'etc/securetty').open('w'))
 
         network_dir_path = jail_rootfs_path / 'etc/systemd/network'
@@ -1994,10 +1987,7 @@ def create_jail(**kwargs):
         cleanup(jail_path)
         raise error
 
-    if start_now:
-        return start_jail(jail_name)
-
-    return 0
+    return start_jail(jail_name) if is_start_now else 0
 
 
 def jail_is_running(jail_name):
@@ -2112,18 +2102,6 @@ def print_table(header, list_of_objects, empty_value_indicator):
         print(' '.join(str(obj.get(hdr)).ljust(widths[hdr]) for hdr in header))
 
 
-def run_command_and_parse_json(command):
-    result = subprocess.run(command, capture_output=True, text=True)
-    output = result.stdout.strip()
-
-    try:
-        parsed_output = json.loads(output)
-        return parsed_output
-    except json.JSONDecodeError as e:
-        eprint(f'Error parsing JSON: {e}')
-        return None
-
-
 def get_all_jail_names():
     try:
         jail_names = [jail_dir.name for jail_dir in JAILS_DIR_PATH.iterdir()]
@@ -2165,7 +2143,16 @@ def list_jails():
         return 0
 
     # Get running jails from machinectl
-    running_machines = run_command_and_parse_json(['machinectl', 'list', '-o', 'json'])
+    running_machines = []
+
+    try:
+        machinectl = ['machinectl', 'list', '-o', 'json']
+        json_data = subprocess.run(machinectl, capture_output=True, text=True)
+        running_machines = json.loads(json_data.stdout.strip())
+    except subprocess.CalledProcessError as e:
+        eprint(f'Failed to get list of jails: {e}')
+    except json.JSONDecodeError as e:
+        eprint(f'Error parsing JSON: {e}')
 
     # Index the machines that are running by their name because only
     # systemd-nspawn machines should be stored
@@ -2228,19 +2215,15 @@ def list_jails():
 
 
 def startup_jails():
-    start_failure = False
+    is_fail = False
 
     for jail_name in get_all_jail_names():
         config = parse_config_file(get_jail_config_path(jail_name))
 
-        if config and config.my_getboolean('startup'):
-            if start_jail(jail_name) != 0:
-                start_failure = True
+        if config and config.my_getboolean('startup') and start_jail(jail_name) != 0:
+            is_fail = True
 
-    if start_failure:
-        return 1
-
-    return 0
+    return 1 if is_fail else 0
 
 
 def split_at_string(lst, string):
@@ -2256,7 +2239,7 @@ def add_parser(subparser, **kwargs):
         # Don't add help if explicitly disabled
         add_help = False
     else:
-        # Never add help with the built in add_help
+        # Never add help with the built-in add_help
         kwargs['add_help'] = False
         add_help = True
 
@@ -2276,7 +2259,7 @@ def add_parser(subparser, **kwargs):
         )
 
     # Setting the add_help after the parser has been created with
-    # add_parser() has no effect, but it allows a look up if this parser
+    # add_parser() has no effect, but it allows a lookup if this parser
     # has a help message available
     parser.add_help = add_help
 
