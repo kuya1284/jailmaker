@@ -1068,8 +1068,8 @@ def start_jail(jail_name):
     # <https://github.com/kinvolk/kube-spawn/pull/328>
     #
     # * DevicePolicy=auto is the default for systemd-run and allows
-    # access to all devices as long as we don't add any
-    # --property=DeviceAllow= flags
+    # access to all devices as long as the --property=DeviceAllow= flag
+    # isn't added
     # <https://manpages.debian.org/bookworm/systemd/systemd.resource-control.5.en.html>
     #
     # We can now successfully run:
@@ -2244,6 +2244,13 @@ def split_at_string(lst, string):
         return lst, []
 
 
+def init_parser():
+    parser = argparse.ArgumentParser(description=__doc__, epilog=DISCLAIMER, allow_abbrev=False)
+    parser.add_argument('--version', action='version', version=__version__)
+
+    return parser
+
+
 def add_parser(subparser, **kwargs):
     # Always add help except for when explicitly disabled
     is_add_help = kwargs.get('add_help', True)
@@ -2469,71 +2476,54 @@ def init_commands(parser):
     return commands
 
 
-def main():
-    if SCRIPT_PATH.stat().st_uid != 0:
-        fail(f'This script should be owned by the root user... Fix it manually with: `chown root {SCRIPT_PATH}`.')
-
-    parser = argparse.ArgumentParser(description=__doc__, epilog=DISCLAIMER, allow_abbrev=False)
-    parser.add_argument('--version', action='version', version=__version__)
-
-    commands = init_commands(parser)
-
-    if os.getuid() != 0:
-        parser.print_help()
-        fail('Run this script as root...')
-
-    # Set appropriate permissions (if not already set) for this file,
-    # since it's executed as root
-    SCRIPT_PATH.chmod(0o760)
-
+def show_help_when_needed(parser, commands):
     # Ignore all args after the first '--'
     args_to_parse = split_at_string(sys.argv[1:], '--')[0]
 
     # Check for help
-    if any(item in args_to_parse for item in ['-h', '--help']):
-        # More than Likely the help output needs to be shown...
-        try:
-            args = vars(parser.parse_known_args(args_to_parse)[0])
+    if not any(item in args_to_parse for item in ['-h', '--help']):
+        return
 
-            # Exit if a subparser wasn't invoked: jlmkr.py --help
-            if args.get('help'):
-                is_print_help = True
-                command = args.get('command')
-                jail_name = args.get('jail_name')
-                is_split_args = args.get('is_split_args', False)
+    # More than Likely the help output needs to be shown...
+    try:
+        args = vars(parser.parse_known_args(args_to_parse)[0])
 
-                # Edge case for some commands
-                if is_split_args and jail_name:
-                    # Ignore all args after the jail name
-                    args_to_parse = split_at_string(args_to_parse, jail_name)[0]
+        # Exit if a subparser wasn't invoked: jlmkr.py --help
+        if args.get('help'):
+            is_print_help = True
+            command = args.get('command')
+            jail_name = args.get('jail_name')
+            is_split_args = args.get('is_split_args', False)
 
-                    # Add back the jail_name as it may be a required
-                    # positional to avoid the except clause below
-                    args_to_parse += [jail_name]
+            # Edge case for some commands
+            if is_split_args and jail_name:
+                # Ignore all args after the jail name
+                args_to_parse = split_at_string(args_to_parse, jail_name)[0]
 
-                    # Parse one more time...
-                    args = vars(parser.parse_known_args(args_to_parse)[0])
+                # Add back the jail_name as it may be a required positional to
+                # avoid the except clause below
+                args_to_parse += [jail_name]
 
-                    # then check if help is still in the remaining args
-                    is_print_help = args.get('help')
+                # Parse one more time...
+                args = vars(parser.parse_known_args(args_to_parse)[0])
 
-                if is_print_help:
-                    commands[command].print_help()
-                    sys.exit()
-        except ExceptionWithParser as e:
-            # Print help output on error, e.g. due to:
-            # "error: the following arguments are required"
-            if e.parser.add_help:
-                e.parser.print_help()
+                # then check if help is still in the remaining args
+                is_print_help = args.get('help')
+
+            if is_print_help:
+                commands[command].print_help()
                 sys.exit()
+    except ExceptionWithParser as e:
+        # Print help output on error, e.g. due to:
+        # "error: the following arguments are required"
+        if e.parser.add_help:
+            e.parser.print_help()
+            sys.exit()
 
-    # Exit on parse errors (e.g. missing positional args)
-    for command in commands:
-        commands[command].exit_on_error = True
 
-    # Parse to find command and function and ignore unknown args, which
-    # may be present, such as args intended to pass through to
-    # systemd-run
+def run_command(parser):
+    # Parse to find command and function and ignore unknown args, which may be
+    # present, such as args intended to pass through to systemd-run
     args = vars(parser.parse_known_args()[0])
     command = args.pop('command', None)
     jail_name = args.get('jail_name')
@@ -2549,21 +2539,23 @@ def main():
         if agree('Create a new jail?', 'y'):
             print()
             sys.exit(create_jail())
-        else:
-            parser.print_help()
-            sys.exit()
 
-    elif command == 'shell':
+        parser.print_help()
+        sys.exit()
+
+    if command == 'shell':
         # Pass anything after the "shell" command to machinectl
         _, shell_args = split_at_string(args_to_parse, command)
         sys.exit(args['func'](shell_args))
-    elif is_split_args and jail_name:
+
+    if is_split_args and jail_name:
         jlmkr_args, remaining_args = split_at_string(args_to_parse, jail_name)
 
         if remaining_args and remaining_args[0] != '--':
-            # Add '--' after the jail name to ensure further args, e.g.
-            # --help or --version, are captured as
-            # systemd_nspawn_user_args
+            # Add '--' after the jail name to ensure further args
+            #
+            # Example:
+            # --help or --version, are captured as systemd_nspawn_user_args
             args_to_parse = jlmkr_args + [jail_name, '--'] + remaining_args
 
     # Parse args again, but show error for unknown args
@@ -2576,6 +2568,30 @@ def main():
     func = args.pop('func')
 
     sys.exit(func(**args))
+
+
+def main():
+    if SCRIPT_PATH.stat().st_uid != 0:
+        fail(f'This script should be owned by the root user... Fix it manually with: `chown root {SCRIPT_PATH}`.')
+
+    parser = init_parser()
+    commands = init_commands(parser)
+
+    if os.getuid() != 0:
+        parser.print_help()
+        fail('Run this script as root...')
+
+    # Set appropriate permissions (if not already set) for this file,
+    # since it's executed as root
+    SCRIPT_PATH.chmod(0o760)
+
+    show_help_when_needed(parser, commands)
+
+    # Exit on parse errors (e.g. missing positional args)
+    for command in commands:
+        commands[command].exit_on_error = True
+
+    run_command(parser)
 
 
 if __name__ == '__main__':
