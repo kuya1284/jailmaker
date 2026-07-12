@@ -241,8 +241,8 @@ View a jail's logs.
 ### NVIDIA Proprietary Driver Install/Unistall
 
 TrueNAS 25.10 (Goldeye) and newer replaced the NVIDIA Proprietary driver with Open Kernel driver. You may replace the 
-Open Kernel driver with the Proprietary driver using the following command, which restore functionality to legacy NVIDIA 
-GPUs, such as Pascal, Maxwell, Volta, etc.
+Open Kernel driver with the Proprietary driver (thanks to **zzzhouuu's** [manually compiled GPU driver extensions](https://github.com/zzzhouuu/truenas-nvidia-drivers)) 
+using the following command, which restore functionality to legacy NVIDIA GPUs, such as Pascal, Maxwell, Volta, etc.
 
 ```shell
 ./jlmkr.py nvidia --action install
@@ -351,3 +351,5 @@ When in need of help or when you think you've found a bug in `jailmaker`,
 * [systemd-run](https://manpages.debian.org/bookworm/systemd/systemd-run.1.en.html)
 * [Run docker in systemd-nspawn](https://wiki.archlinux.org/title/systemd-nspawn#Run_docker_in_systemd-nspawn)
 * [The original Jailmaker gist](https://gist.github.com/Jip-Hop/4704ba4aa87c99f342b2846ed7885a5d)
+* [Github > zzzhouuu > TrueNAS Nvidia Driver Build](https://github.com/zzzhouuu/truenas-nvidia-drivers)
+* [zzzhouuu's manually compiled legacy GPU driver extensions](https://truenas-drivers.zhouyou.info/index.html)
