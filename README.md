@@ -256,7 +256,9 @@ Execute the following command to restore the Open Kernel driver.
 
 **NOTE:** The commands above will have no effect on TrueNAS version older than 25.10. When `gpu_passthrough_nvidia` is 
 set, Jailmaker will automatically install the NVIDIA Proprietary driver for systems having a legacy NVIDIA GPU. 
-Jailmaker will base this on the **compute capability** of the NVIDIA GPU; if the value must be lower than **7.5**.
+Jailmaker will base this on the **compute capability** of the NVIDIA GPU; if the value must be lower than **7.5**. The 
+NVIDIA Proprietary driver will only work for GPUs having an architecture older than Blackwell (i.e. Turing, Ada 
+Lovelace, etc.). For systems running a Blackwell-based GPUs or newer, the NVIDIA Open Kernel driver must be used.
 
 ### Additional Commands
 
