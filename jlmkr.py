@@ -1393,7 +1393,8 @@ def agree(question, default=None):
     """
     Ask user a yes/no question.
     """
-    hint = '[Y/n]' if default == 'y' else ('[y/N]' if default == 'n' else '[y/n]')
+    hint = '[Y/n]' if default == 'y' else '[y/n]'
+    hint = '[y/N]' if default == 'n' else hint
 
     while True:
         user_input = input(f'{question} {hint} ') or default
@@ -1665,7 +1666,9 @@ def interactive_create():
     else:
         print()
 
-        if not agree(f'Install the recommended image ({recommended_distro} {recommended_release})?', 'y'):
+        question = f'Install the recommended image ({recommended_distro} {recommended_release})?'
+
+        if not agree(question, 'y'):
             dprint(
                 f"""
                 {YELLOW}{BOLD}WARNING: ADVANCED USAGE{NORMAL}
@@ -1780,10 +1783,8 @@ def interactive_create():
             """
         )
 
-        config.my_set(
-            'startup',
-            agree(f'Do you want to start this jail when running: {SCRIPT_NAME} startup?', 'n')
-        )
+        question = f'Do you want to start this jail when running: {SCRIPT_NAME} startup?'
+        config.my_set('startup', agree(question, 'n'))
 
     print()
     is_start_now = agree('Do you want to start this jail now (when create is done)?', 'y')
