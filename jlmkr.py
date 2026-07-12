@@ -190,7 +190,7 @@ class KeyValueParser(configparser.ConfigParser):
         self._comment_id = 0
 
         # Default delimiter to use
-        delimiter = self._delimiters[0]
+        delimiter = self._delimiters[0] or ''
 
         # Template to store comments as key value pair
         self._comment_template = '#{0} ' + delimiter + ' {1}'
@@ -350,6 +350,15 @@ def fail(*args, **kwargs):
     sys.exit(1)
 
 
+def intel_fail(error_msg):
+    """
+    Print custom Intel error to stderr and exit.
+    """
+    extra_msg = 'disable the "gpu_passthrough_intel" setting if the problem persists'
+
+    fail(f'{RED}ERROR: {error_msg}; {extra_msg}.{NORMAL}')
+
+
 def nvidia_fail(error_msg):
     """
     Print custom NVIDIA error to stderr and exit.
@@ -371,8 +380,26 @@ def get_jail_rootfs_path(jail_name):
     return get_jail_path(jail_name) /  JAIL_ROOTFS_NAME
 
 
-# Is the NVIDIA Open Kernel driver installed?
+def test_intel_driver():
+    """
+    Runs "intel_gpu_frequency" to test the Intel driver, to make sure
+    an actual Intel GPU exists and that the driver is installed.
+    """
+    try:
+        subprocess.run(
+            'intel_gpu_frequency',
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+    except subprocess.CalledProcessError as e:
+        intel_fail(f'Failed to test Intel driver using intel_gpu_frequency: {e}')
+
+
 def is_nvidia_open_driver_installed():
+    """
+    Is the NVIDIA Open Kernel driver installed?
+    """
     driver_version_file = Path('/proc/driver/nvidia/version')
 
     if not driver_version_file.exists():
@@ -407,12 +434,14 @@ def install_nvidia_modules():
     Loads the NVIDIA Unified Virtual Memory kernel module, which will
     automatically load all other modules that are needed.
     """
+    nvidia_uvm = 'nvidia-current-uvm'
+
     try:
-        nvidia_uvm = 'nvidia-current-uvm'
         subprocess.run(['modinfo', nvidia_uvm], check=True, capture_output=True)
     except subprocess.CalledProcessError:
+        nvidia_uvm = 'nvidia-uvm'
+
         try:
-            nvidia_uvm = 'nvidia-uvm'
             subprocess.run(['modinfo', nvidia_uvm], check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
             nvidia_fail(f'Failed to identify NVIDIA Unified Virtual Memory module: {e}')
@@ -427,12 +456,14 @@ def uninstall_nvidia_modules():
     """
     Uninstalls all NVIDIA kernel modules.
     """
+    nvidia_uvm = 'nvidia-current-uvm'
+
     try:
-        nvidia_uvm = 'nvidia-current-uvm'
         subprocess.run(['modinfo', nvidia_uvm], check=True, capture_output=True)
     except subprocess.CalledProcessError:
+        nvidia_uvm = 'nvidia-uvm'
+
         try:
-            nvidia_uvm = 'nvidia-uvm'
             subprocess.run(['modinfo', nvidia_uvm], check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
             nvidia_fail(f'Failed to identify NVIDIA Unified Virtual Memory module: {e}')
@@ -599,17 +630,17 @@ def toggle_system_resources_dataset(is_editable):
     try:
         zfs_list = 'zfs list -H -o name /usr'
         zfs_list = subprocess.run(zfs_list, check=True, shell=True, capture_output=True)
+
+        try:
+            readonly = 'off' if is_editable else 'on'
+            usr_dataset = zfs_list.stdout.decode().strip()
+
+            subprocess.run(['zfs', 'set', f'readonly={readonly}', usr_dataset], check=True)
+        except subprocess.CalledProcessError as e:
+            action = 'editable' if is_editable else 'read-only'
+            nvidia_fail(f'Failed to toggle /usr dataset to {action}: {e}')
     except subprocess.CalledProcessError as e:
         nvidia_fail(f'Failed to get /usr dataset: {e}')
-
-    try:
-        readonly = 'off' if is_editable else 'on'
-        usr_dataset = zfs_list.stdout.decode().strip()
-
-        subprocess.run(['zfs', 'set', f'readonly={readonly}', usr_dataset], check=True)
-    except subprocess.CalledProcessError as e:
-        action = 'editable' if is_editable else 'read-only'
-        nvidia_fail(f'Failed to toggle /usr dataset to {action}: {e}')
 
 
 def get_nvidia_proprietary_driver_file():
@@ -732,18 +763,15 @@ def get_nvidia_driver_dependency_list(is_libraries=False):
     if is_libraries:
         nvidia_container_cli.append('--libraries')
 
+    dependencies = ''
+
     try:
         dependencies = subprocess.run(nvidia_container_cli, check=True, capture_output=True)
     except subprocess.CalledProcessError as e:
         nvidia_fail(f'Failed to identify NVIDIA driver files: {e}')
 
-    return dependencies.stdout.decode().split('\n')
+    return dependencies and dependencies.stdout.decode().split('\n')
 
-
-# Test Intel GPU by decoding mp4 file (output is discarded)
-# Run the commands below in the jail:
-# curl -o bunny.mp4 https://www.w3schools.com/html/mov_bbb.mp4
-# ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -i bunny.mp4 -f null - && echo 'SUCCESS!'
 
 def passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_additional_args):
     """
@@ -752,18 +780,28 @@ def passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_additional_args):
     if not is_gpu_passthrough_intel:
         return
 
+    # Does the system actually have an Intel GPU installed?
+    lspci = 'lspci -k | grep -E "VGA|3D|Display" | grep -i intel'
+    lspci = subprocess.run(lspci, shell=True, capture_output=True)
+
+    if not lspci.stdout.decode().strip():
+        nvidia_fail('No Intel GPU detected')
+    if lspci.stderr:
+        nvidia_fail(lspci.stderr.decode())
+
     dri_path = Path('/dev/dri')
 
     if not dri_path.exists():
-        dprint(
-            """
-            No Intel GPU seems to be present...
-            Skipping passthrough of Intel GPU.
-            """,
-            True
-        )
+        intel_fail('No Intel GPU detected')
 
-        return
+    # This will fail when an Intel GPU wasn't detected or there's a
+    # problem with the Intel driver. An additional test may be performed
+    # inside the jail by executing the following commands:
+    #
+    # $ sudo install ffmpeg
+    # $ curl -o bunny.mp4 https://www.w3schools.com/html/mov_bbb.mp4
+    # $ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -i bunny.mp4 -f null - && echo 'SUCCESS!'
+    test_intel_driver()
 
     systemd_nspawn_additional_args.append(f'--bind={dri_path}')
 
