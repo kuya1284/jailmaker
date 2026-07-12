@@ -34,7 +34,7 @@ Why continue the effort?
 * iXsystems [announced](https://www.youtube.com/watch?v=ixYNPAv9olY) that they have decided to drop [Incus](https://linuxcontainers.org/incus/) support in **TrueNAS 26**, and will be reverting back to [libvirt](https://libvirt.org/).
 * Running Docker apps in a self-contained environment could make things easier with managing containerized apps, especially if you need to install OS packages, such as **cron** or **logrotate**, that can't be installed directly on the TrueNAS host.
 
-There won't be a lot of effort put into Jip-Hop's excellent Jailmaker script; however, minimal effort will be given 
+There won't be a lot of effort put into Jip-Hop's brilliant Jailmaker script; however, minimal effort will be given 
 as time permits to help address issues that may arise whenever something stops functioning after upgrading to a new 
 version of TrueNAS CE.
 
@@ -237,6 +237,26 @@ View a jail's logs.
 ```shell
 ./jlmkr.py log myjail
 ```
+
+### NVIDIA Proprietary Driver Install/Unistall
+
+TrueNAS 25.10 (Goldeye) and newer replaced the NVIDIA Proprietary driver with Open Kernel driver. You may replace the 
+Open Kernel driver with the Proprietary driver using the following command, which restore functionality to legacy NVIDIA 
+GPUs, such as Pascal, Maxwell, Volta, etc.
+
+```shell
+./jlmkr.py nvidia --action install
+```
+
+Execute the following command to restore the Open Kernel driver.
+
+```shell
+./jlmkr.py nvidia --action uninstall
+```
+
+**NOTE:** The commands above will have no effect on TrueNAS version older than 25.10. When `gpu_passthrough_nvidia` is 
+set, Jailmaker will automatically install the NVIDIA Proprietary driver for systems having a legacy NVIDIA GPU. 
+Jailmaker will base this on the **compute capability** of the NVIDIA GPU; if the value must be lower than **7.5**.
 
 ### Additional Commands
 
