@@ -40,10 +40,6 @@ DEFAULT_CONFIG = """startup=0
 gpu_passthrough_intel=0
 gpu_passthrough_nvidia=0
 
-# Force Proprietary NVIDIA drivers to be installed on TrueNAS CE Goldeye
-# or newer
-force_nvidia_legacy_driver=0
-
 # Turning off seccomp filtering improves performance at the expense of
 # security
 seccomp=1
@@ -363,7 +359,7 @@ def nvidia_fail(error_msg):
     """
     Print custom NVIDIA error to stderr and exit.
     """
-    extra_msg = 'disable the "gpu_passthrough_nvidia" and "force_nvidia_legacy_driver" settings if the problem persists'
+    extra_msg = 'disable the "gpu_passthrough_nvidia" setting if the problem persists'
 
     fail(f'{RED}ERROR: {error_msg}; {extra_msg}.{NORMAL}')
 
@@ -478,6 +474,24 @@ def uninstall_nvidia_modules():
         subprocess.run(modprobe, check=True, shell=True)
     except subprocess.CalledProcessError as e:
         nvidia_fail(f'Failed to remove one or more NVIDIA kernel modules: {e}')
+
+
+def test_nvidia_gpu_exists():
+    """
+    Does the system actually have an NVIDIA GPU installed?
+    """
+    lspci = 'lspci -k | grep -E "VGA|3D|Display" | grep -i nvidia'
+    lspci = subprocess.run(lspci, shell=True, capture_output=True)
+
+    if not lspci.stdout.decode().strip():
+        eprint('No NVIDIA GPU detected')
+        return False
+
+    if lspci.stderr:
+        eprint(lspci.stderr.decode())
+        return False
+
+    return True
 
 
 def test_nvidia_driver():
@@ -773,7 +787,7 @@ def get_nvidia_driver_dependency_list(is_libraries=False):
     return dependencies and dependencies.stdout.decode().split('\n')
 
 
-def passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_additional_args):
+def passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_extra_args):
     """
     Enables Intel GPU passthrough from the host to the jail.
     """
@@ -803,63 +817,25 @@ def passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_additional_args):
     # $ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi -i bunny.mp4 -f null - && echo 'SUCCESS!'
     test_intel_driver()
 
-    systemd_nspawn_additional_args.append(f'--bind={dri_path}')
+    systemd_nspawn_extra_args.append(f'--bind={dri_path}')
 
 
-def passthrough_nvidia(
-    is_gpu_passthrough_nvidia,
-    is_force_nvidia_legacy_driver,
-    systemd_nspawn_additional_args,
-    jail_name
-):
+def passthrough_nvidia(is_gpu_passthrough_nvidia, systemd_nspawn_extra_args, jail_name):
     """
     Enables NVIDIA GPU passthrough from the host to the jail.
     """
     jail_rootfs_path = get_jail_rootfs_path(jail_name)
     ld_config_file = jail_rootfs_path / f'etc/ld.so.conf.d/{SHORTNAME}-nvidia.conf'
 
-    # Forcefully disable the "force_nvidia_legacy_driver" setting for
-    # TrueNAS CE versions older than Goldeye because the NVIDIA
-    # Proprietary driver will already be installed
-    if parse_version(get_truenas_version()) < parse_version(VERSION_GOLDEYE):
-        is_force_nvidia_legacy_driver = False
-
     # Should the config file be deleted, if it was created when
     # passthrough was previously enabled?
     if not is_gpu_passthrough_nvidia:
         print('Deleting the dynamic libraries config file')
         ld_config_file.unlink(missing_ok=True)
+        return
 
-    # Should the original NVIDIA Open Kernel driver be restored, if a
-    # backup of the driver exists?
-    if not (is_force_nvidia_legacy_driver or is_nvidia_proprietary_driver_required()):
-        backup_driver_file = get_nvidia_open_driver_backup_file()
-
-        if backup_driver_file.is_file():
-            print('Restoring the NVIDIA Open Kernel driver')
-            uninstall_nvidia_modules()
-            toggle_nvidia_drivers_setting(False)
-            toggle_system_resources_dataset(True)
-
-            shutil.move(backup_driver_file, get_nvidia_proprietary_driver_file())
-
-            toggle_system_resources_dataset(False)
-            toggle_nvidia_drivers_setting(True)
-            install_nvidia_modules()
-
-        # Short-circuit when both "gpu_passthrough_nvidia" and
-        # "force_nvidia_legacy_driver" are disabled
-        if not is_gpu_passthrough_nvidia:
-            return
-
-    # Does the system actually have an NVIDIA GPU installed?
-    lspci = 'lspci -k | grep -E "VGA|3D|Display" | grep -i nvidia'
-    lspci = subprocess.run(lspci, shell=True, capture_output=True)
-
-    if not lspci.stdout.decode().strip():
-        nvidia_fail('No NVIDIA GPU detected')
-    if lspci.stderr:
-        nvidia_fail(lspci.stderr.decode())
+    if not test_nvidia_gpu_exists():
+        sys.exit(1)
 
     # Make sure the "Install NVIDIA Drivers" configuration setting is
     # enabled, then install the modules and driver
@@ -867,15 +843,10 @@ def passthrough_nvidia(
     install_nvidia_modules()
     test_nvidia_driver()
 
-    # Replace the NVIDIA Open Kernel driver with the NVIDIA  Proprietary
+    # Replace the NVIDIA Open Kernel driver with the NVIDIA Proprietary
     # driver when applicable
-    if is_force_nvidia_legacy_driver or is_nvidia_proprietary_driver_required():
+    if is_nvidia_proprietary_driver_required():
         install_nvidia_proprietary_driver()
-
-    # Short-circuit when the NVIDIA Proprietary driver is needed, but
-    # when NVIDIA passthrough is not
-    if not is_gpu_passthrough_nvidia:
-        return
 
     # Enable Persistence mode to ensure that the NVIDIA Modeset module
     # gets installed and to avoid repetitive GPU initialization
@@ -958,7 +929,90 @@ def passthrough_nvidia(
         except subprocess.CalledProcessError as e:
             nvidia_fail(f'Failed to run ldconfig inside "{jail_name}": {e}')
 
-    systemd_nspawn_additional_args += nvidia_mounts
+    systemd_nspawn_extra_args += nvidia_mounts
+
+
+def get_nvidia_driver_version():
+    driver_version = None
+
+    try:
+        nvidia_smi_args = ['--query-gpu=driver_version','--format=csv,noheader']
+        driver_version = get_nvidia_smi_response(nvidia_smi_args)
+    except subprocess.CalledProcessError as e:
+        nvidia_fail(f'Failed to determine NVIDIA driver version: {e}')
+
+    return driver_version
+
+
+def nvidia_proprietary_driver_install_or_uninstall(**driver_options):
+    action = driver_options.pop('action', None)
+
+    print()
+
+    if action == 'uninstall':
+        if is_nvidia_open_driver_installed():
+            print(f'{YELLOW}NVIDIA Proprietary driver not installed... nothing to do.{NORMAL}')
+            return 0
+
+        backup_driver_file = get_nvidia_open_driver_backup_file()
+
+        if not backup_driver_file.is_file():
+            eprint(f'{RED}NVIDIA Open Kernel driver missing.{NORMAL}')
+            return 1
+
+        print('Restoring the NVIDIA Open Kernel driver...')
+        uninstall_nvidia_modules()
+        toggle_nvidia_drivers_setting(False)
+        toggle_system_resources_dataset(True)
+
+        shutil.move(backup_driver_file, get_nvidia_proprietary_driver_file())
+
+        toggle_system_resources_dataset(False)
+        toggle_nvidia_drivers_setting(True)
+        install_nvidia_modules()
+
+        driver_version = get_nvidia_driver_version()
+        success_msg = 'NVIDIA Open Kernel Driver was restored successfully, but the version could not be determined.'
+
+        if driver_version:
+            success_msg = f'NVIDIA Open Kernel Driver "{driver_version}" was restored successfully.'
+
+        print(success_msg)
+        print()
+
+        return 0
+
+    if parse_version(get_truenas_version()) < parse_version(VERSION_GOLDEYE):
+        print(f'{YELLOW}NVIDIA Proprietary driver is already installed... nothing to do.{NORMAL}')
+        return 1
+
+    if not test_nvidia_gpu_exists():
+        return 1
+
+    # Replace the NVIDIA Open Kernel driver with the NVIDIA Proprietary
+    # driver when applicable
+    if not is_nvidia_open_driver_installed():
+        print(f'{YELLOW}NVIDIA Proprietary driver is already installed... nothing to do.{NORMAL}')
+        return 0
+
+    print('Installing the NVIDIA Proprietary driver...')
+
+    # Make sure the "Install NVIDIA Drivers" configuration setting is
+    # enabled, then install the modules and driver
+    toggle_nvidia_drivers_setting(True)
+    install_nvidia_modules()
+
+    install_nvidia_proprietary_driver()
+
+    driver_version = get_nvidia_driver_version()
+    success_msg = 'NVIDIA Proprietary Driver was installed successfully, but the version could not be determined.'
+
+    if driver_version:
+        success_msg = f'NVIDIA Proprietary Driver "{driver_version}" was installed successfully.'
+
+    print(success_msg)
+    print()
+    return 0
 
 
 def exec_jail(jail_name, cmd, is_return_code=True):
@@ -986,8 +1040,6 @@ def exec_jail(jail_name, cmd, is_return_code=True):
         return e.returncode
 
     return systemd_run.returncode if is_return_code else systemd_run
-
-
 
 
 def status_jail(jail_name, args):
@@ -1056,13 +1108,13 @@ def systemd_escape_path(path):
     return ''.join(path)
 
 
-def add_hook(jail_path, systemd_run_additional_args, hook_command, hook_type):
+def add_hook(jail_path, systemd_run_extra_args, hook_command, hook_type):
     if not hook_command:
         return
 
     # Run the command directly if it doesn't start with a shebang
     if not hook_command.startswith('#!'):
-        systemd_run_additional_args += [f'--property={hook_type}={hook_command}']
+        systemd_run_extra_args += [f'--property={hook_type}={hook_command}']
         return
 
     # Otherwise write a script file and call that
@@ -1073,7 +1125,7 @@ def add_hook(jail_path, systemd_run_additional_args, hook_command, hook_type):
         print(hook_command, file=hook_file.open('w'))
 
     hook_file.chmod(0o700)
-    systemd_run_additional_args += [f'--property={hook_type}={systemd_escape_path(hook_file)}']
+    systemd_run_extra_args += [f'--property={hook_type}={systemd_escape_path(hook_file)}']
 
 
 def start_jail(jail_name):
@@ -1095,14 +1147,19 @@ def start_jail(jail_name):
         return 1
 
     is_seccomp = config.my_getboolean('seccomp')
+    pre_start_hook = config.my_get('pre_start_hook')
+    post_start_hook = config.my_get('post_start_hook')
+    post_stop_hook = config.my_get('post_stop_hook')
+    is_gpu_passthrough_intel = config.my_getboolean('gpu_passthrough_intel')
+    is_gpu_passthrough_nvidia = config.my_getboolean('gpu_passthrough_nvidia')
 
-    systemd_run_additional_args = [
+    systemd_run_extra_args = [
         f'--unit={SHORTNAME}-{jail_name}',
         f'--working-directory={jail_path}',
         f'--description=My nspawn jail {jail_name} [created with Jailmaker]',
     ]
 
-    systemd_nspawn_additional_args = [
+    systemd_nspawn_extra_args = [
         f'--machine={jail_name}',
         f'--directory={JAIL_ROOTFS_NAME}',
     ]
@@ -1130,17 +1187,12 @@ def start_jail(jail_name):
 
     # Add hooks to execute commands on the host before/after starting
     # and after stopping a jail
-    add_hook(jail_path, systemd_run_additional_args, config.my_get('pre_start_hook'), 'ExecStartPre')
-    add_hook(jail_path, systemd_run_additional_args, config.my_get('post_start_hook'), 'ExecStartPost')
-    add_hook(jail_path, systemd_run_additional_args, config.my_get('post_stop_hook'), 'ExecStopPost')
+    add_hook(jail_path, systemd_run_extra_args, pre_start_hook, 'ExecStartPre')
+    add_hook(jail_path, systemd_run_extra_args, post_start_hook, 'ExecStartPost')
+    add_hook(jail_path, systemd_run_extra_args, post_stop_hook, 'ExecStopPost')
 
-    passthrough_intel(config.my_getboolean('gpu_passthrough_intel'), systemd_nspawn_additional_args)
-    passthrough_nvidia(
-        config.my_getboolean('gpu_passthrough_nvidia'),
-        config.my_getboolean('force_nvidia_legacy_driver'),
-        systemd_nspawn_additional_args,
-        jail_name
-    )
+    passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_extra_args)
+    passthrough_nvidia(is_gpu_passthrough_nvidia, systemd_nspawn_extra_args, jail_name)
 
     if is_seccomp is False:
         # Disabling seccomp filtering by passing
@@ -1171,7 +1223,7 @@ def start_jail(jail_name):
         #
         # $ docker run --rm -it --security-opt seccomp=unconfined debian:jessie unshare --map-root-user --user sh -c whoami
         # root
-        systemd_run_additional_args += ['--setenv=SYSTEMD_SECCOMP=0']
+        systemd_run_extra_args += ['--setenv=SYSTEMD_SECCOMP=0']
 
     initial_setup = False
 
@@ -1184,16 +1236,16 @@ def start_jail(jail_name):
     if not machine_id.exists() and (initial_setup := config.my_get('initial_setup')):
         # Ensure the jail init system is ready before executing
         # everything in "initial_setup"
-        systemd_nspawn_additional_args += ['--notify-ready=yes']
+        systemd_nspawn_extra_args += ['--notify-ready=yes']
 
     systemd_run = [
         'systemd-run',
         *shlex.split(config.my_get('systemd_run_default_args')),
-        *systemd_run_additional_args,
+        *systemd_run_extra_args,
         '--',
         'systemd-nspawn',
         *shlex.split(config.my_get('systemd_nspawn_default_args')),
-        *systemd_nspawn_additional_args,
+        *systemd_nspawn_extra_args,
         *shlex.split(config.my_get('systemd_nspawn_user_args')),
     ]
 
@@ -1630,7 +1682,6 @@ def non_interactive_create(jail_name, create_options):
         'distro',
         'gpu_passthrough_intel',
         'gpu_passthrough_nvidia',
-        'force_nvidia_legacy_driver',
         'release',
         'seccomp',
         'startup',
@@ -1747,13 +1798,6 @@ def interactive_create():
             config,
             'gpu_passthrough_nvidia',
             'Passthrough the nvidia GPU (if present)?'
-        )
-
-        print()
-        agree_with_default(
-            config,
-            'force_nvidia_legacy_driver',
-            'Force the NVIDIA Proprietary driver for TrueNAS CE Goldeye and newer (if GPU present)?'
         )
 
         dprint(
@@ -2350,7 +2394,7 @@ def add_parser(subparser, **kwargs):
         parser.add_argument(
             '-h',
             '--help',
-            help='show this help message and exit',
+            help='Show this help message and exit',
             action='store_true'
         )
 
@@ -2381,13 +2425,13 @@ def init_commands(parser):
 
     jail_name_help = {
         'name_or_flags': 'jail_name',
-        'help': 'name of the jail'
+        'help': 'Name of the jail'
     }
 
     command_definitions = [
         {
             'name': 'create',
-            'help': 'create a new jail',
+            'help': 'Create a new jail',
             'func': create_jail,
             'split_args': True,
             'options_or_positional_args': [
@@ -2396,144 +2440,155 @@ def init_commands(parser):
                 {'name_or_flags': '--release'},
                 {
                     'name_or_flags': '--start',
-                    'help': 'start jail after create',
+                    'help': 'Start jail after create',
                     'action': 'store_true',
                 },
                 {
                     'name_or_flags': '--startup',
+                    'help': f'Start this jail when running: {SCRIPT_NAME} startup',
                     'type': int,
                     'choices': [0, 1],
-                    'help': f'start this jail when running: {SCRIPT_NAME} startup',
                 },
                 {
                     'name_or_flags': '--seccomp',
+                    'help': 'Turn off seccomp filtering to improve performance at the expense of security',
                     'type': int,
                     'choices': [0, 1],
-                    'help': 'turning off seccomp filtering improves performance at the expense of security',
                 },
                 {
                     'name_or_flags': ['-c', '--config'],
-                    'help': 'path to config file template or - for stdin',
+                    'help': 'Path to config file template or - for stdin',
                 },
                 {
                     'name_or_flags': ['-gi', '--gpu_passthrough_intel'],
+                    'help': 'Enable or disable Intel GPU Passthrough',
                     'type': int,
                     'choices': [0, 1],
                 },
                 {
                     'name_or_flags': ['-gn', '--gpu_passthrough_nvidia'],
-                    'type': int,
-                    'choices': [0, 1],
-                },
-                {
-                    'name_or_flags': ['-fl', '--force_nvidia_legacy_driver'],
+                    'help': 'Enable or disable NVIDIA GPU Passthrough',
                     'type': int,
                     'choices': [0, 1],
                 },
                 {
                     'name_or_flags': 'systemd_nspawn_user_args',
+                    'help': 'Additional systemd-nspawn flags',
                     'nargs': '*',
-                    'help': 'add additional systemd-nspawn flags',
                 },
             ],
         },
         {
             'name': 'edit',
-            'help': f'edit jail config with {get_text_editor()} text editor',
+            'help': f'Edit jail config with "{get_text_editor()}" text editor',
             'func': edit_jail,
             'options_or_positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'exec',
-            'help': 'execute a command in the jail',
+            'help': 'Execute a command in the jail',
             'func': exec_jail,
             'split_args': True,
             'options_or_positional_args': [
                 jail_name_help.copy(),
                 {
                     'name_or_flags': 'cmd',
+                    'help': 'Command to execute',
                     'nargs': '*',
-                    'help': 'command to execute',
                 },
             ],
         },
         {
             'name': 'images',
-            'help': 'list available images to create jails from',
+            'help': 'List available images to create jails from',
             'func': run_lxc_download_script,
         },
         {
             'name': 'list',
-            'help': 'list jails',
+            'help': 'List jails',
             'func': list_jails,
         },
         {
             'name': 'log',
-            'help': 'show jail log',
+            'help': 'Show jail log',
             'func': log_jail,
             'split_args': True,
             'options_or_positional_args': [
                 jail_name_help.copy(),
                 {
                     'name_or_flags': 'args',
+                    'help': 'Args to pass to journalctl',
                     'nargs': '*',
-                    'help': 'args to pass to journalctl',
+                },
+            ],
+        },
+        {
+            'name': 'nvidia',
+            'help': 'Install or uninstall NVIDIA Proprietary driver on host (TrueNAS Goldeye or newer only)',
+            'func': nvidia_proprietary_driver_install_or_uninstall,
+            'options_or_positional_args': [
+                {
+                    'name_or_flags': '--action',
+                    'help': 'Start jail after create',
+                    'type': str,
+                    'choices': ['install', 'uninstall'],
+                    'required': True,
                 },
             ],
         },
         {
             'name': 'remove',
-            'help': 'remove previously created jail',
+            'help': 'Remove a jail',
             'func': remove_jail,
             'options_or_positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'restart',
-            'help': 'restart a running jail',
+            'help': 'Restart a running jail',
             'func': restart_jail,
             'options_or_positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'shell',
-            'help': 'open shell in running jail (alias for machinectl shell)',
+            'help': 'Open a shell in running jail (alias for machinectl shell)',
             'func': shell_jail,
             'add_help': False,
             'options_or_positional_args': [
                 {
                     'name_or_flags': 'args',
+                    'help': 'Args to pass to machinectl shell',
                     'nargs': '*',
-                    'help': 'args to pass to machinectl shell',
                 },
             ],
         },
         {
             'name': 'start',
-            'help': 'start previously created jail',
+            'help': 'Start a jail',
             'func': start_jail,
             'options_or_positional_args': [jail_name_help.copy()],
         },
         {
             'name': 'startup',
-            'help': 'startup selected jails',
+            'help': 'Start selected jails',
             'func': startup_jails,
         },
         {
             'name': 'status',
-            'help': 'show jail status',
+            'help': 'Show jail status',
             'func': status_jail,
             'split_args': True,
             'options_or_positional_args': [
                 jail_name_help.copy(),
                 {
                     'name_or_flags': 'args',
+                    'help': 'Args to pass to systemctl',
                     'nargs': '*',
-                    'help': 'args to pass to systemctl',
                 },
             ],
         },
         {
             'name': 'stop',
-            'help': 'stop a running jail',
+            'help': 'Stop a running jail',
             'func': stop_jail,
             'options_or_positional_args': [jail_name_help.copy()],
         },
