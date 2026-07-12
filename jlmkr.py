@@ -332,6 +332,16 @@ def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 
+def dprint(message, is_error=False):
+    message = dedent(message)
+
+    if is_error:
+        eprint(message)
+        return
+
+    print(message)
+
+
 def fail(*args, **kwargs):
     """
     Print to stderr and exit.
@@ -745,12 +755,13 @@ def passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_additional_args):
     dri_path = Path('/dev/dri')
 
     if not dri_path.exists():
-        eprint(dedent(
+        dprint(
             """
-            No intel GPU seems to be present...
-            Skip passthrough of intel GPU.
-            """
-        ))
+            No Intel GPU seems to be present...
+            Skipping passthrough of Intel GPU.
+            """,
+            True
+        )
 
         return
 
@@ -1148,24 +1159,25 @@ def start_jail(jail_name):
         *shlex.split(config.my_get('systemd_nspawn_user_args')),
     ]
 
-    print(dedent(
+    dprint(
         f"""
         Starting jail {jail_name} with the following command:
 
         {shlex.join(systemd_run)}
         """
-    ))
+    )
 
     try:
         systemd_run = subprocess.run(systemd_run, check=True)
     except subprocess.CalledProcessError as e:
-        eprint(dedent(
+        dprint(
             f"""
             Failed to start jail {jail_name}...
             In case of a config error, you may fix it with:
             {SCRIPT_NAME} edit {jail_name}
-            """
-        ))
+            """,
+            True
+        )
 
         return e.returncode
 
@@ -1487,7 +1499,7 @@ def check_jail_name_valid(name):
     if re.match(r'^[.a-zA-Z0-9-]{1,64}$', name) and not name.startswith('.') and '..' not in name:
         return True
 
-    eprint(dedent(
+    dprint(
         f"""
         {YELLOW}{BOLD}WARNING: INVALID NAME{NORMAL}
 
@@ -1496,8 +1508,9 @@ def check_jail_name_valid(name):
         - no leading or trailing dots
         - no sequences of multiple dots
         - max 64 characters
-        """
-    ))
+        """,
+        True
+    )
 
     return False
 
@@ -1601,13 +1614,13 @@ def non_interactive_create(jail_name, create_options):
             is_user_override = True
 
     if not is_user_override:
-        print(dedent(
+        dprint(
             f"""
-            Hint: run `{SCRIPT_NAME} create` without any arguments for interactive config.
+            HINT: run `{SCRIPT_NAME} create` without any arguments for interactive config.
             Or use CLI args to override the default options.
             For more info, run: `{SCRIPT_NAME} create --help`
             """
-        ))
+        )
 
     return config, is_start_now
 
@@ -1627,7 +1640,7 @@ def interactive_create():
     print()
 
     if agree('Do you wish to create a jail from a config template?', 'n'):
-        print(dedent(
+        dprint(
             """
             A text editor will open so you can provide the config template.
 
@@ -1635,7 +1648,7 @@ def interactive_create():
             2. Paste it into the text editor
             3. Save and close the text editor
             """
-        ))
+        )
 
         input('Press Enter to open the text editor.')
 
@@ -1653,7 +1666,7 @@ def interactive_create():
         print()
 
         if not agree(f'Install the recommended image ({recommended_distro} {recommended_release})?', 'y'):
-            print(dedent(
+            dprint(
                 f"""
                 {YELLOW}{BOLD}WARNING: ADVANCED USAGE{NORMAL}
 
@@ -1661,7 +1674,7 @@ def interactive_create():
                 But not all of them may work with {SCRIPT_NAME} since these images are made for LXC.
                 Distros based on systemd probably work (e.g. Ubuntu, Arch Linux and Rocky Linux).
                 """
-            ))
+            )
 
             input('Press Enter to continue...')
             print()
@@ -1702,7 +1715,7 @@ def interactive_create():
             'Force the NVIDIA Proprietary driver for TrueNAS CE Goldeye and newer (if GPU present)?'
         )
 
-        print(dedent(
+        dprint(
             f"""
             {YELLOW}{BOLD}WARNING: CHECK SYNTAX{NORMAL}
 
@@ -1710,7 +1723,7 @@ def interactive_create():
             With incorrect flags the jail may not start.
             It is possible to correct/add/remove flags post-install.
             """
-        ))
+        )
 
         if agree('Show the man page for systemd-nspawn?', 'n'):
             subprocess.run(['man', 'systemd-nspawn'])
@@ -1723,12 +1736,12 @@ def interactive_create():
             except AttributeError:
                 base_os_version = recommended_release
 
-            print(dedent(
+            dprint(
                 f"""
                 You may read the systemd-nspawn manual online:
                 https://manpages.debian.org/{base_os_version}/systemd-container/systemd-nspawn.1.en.html
                 """
-            ))
+            )
 
         # Backslashes and colons need to be escaped in bind mount
         # options. For example, to bind mount a file called:
@@ -1738,37 +1751,38 @@ def interactive_create():
         # the corresponding command would be:
         #
         # --bind-ro='/mnt/data/weird chars \:?\\"'
-        print(dedent(
+        dprint(
             """
             Would you like to add additional systemd-nspawn flags?
+            
             For example to mount directories inside the jail you may:
+            
             Mount the TrueNAS location /mnt/pool/dataset to the /home directory of the jail with:
             --bind='/mnt/pool/dataset:/home'
+            
             Or the same, but readonly, with:
             --bind-ro='/mnt/pool/dataset:/home'
+            
             Or create macvlan interface with:
             --network-macvlan=eno1 --resolv-conf=bind-host
             """
-        ))
+        )
 
         config.my_set(
             'systemd_nspawn_user_args',
             '\n    '.join(shlex.split(input('Additional flags: ') or '')),
         )
 
-        print(dedent(
+        dprint(
             f"""
             The `{SCRIPT_NAME} startup` command can automatically start a selection of jails.
             This comes in handy when you want to automatically start multiple jails after booting TrueNAS CE (e.g. from a Post Init Script).
             """
-        ))
+        )
 
         config.my_set(
             'startup',
-            agree(
-                f'Do you want to start this jail when running: {SCRIPT_NAME} startup?',
-                'n'
-            )
+            agree(f'Do you want to start this jail when running: {SCRIPT_NAME} startup?', 'n')
         )
 
     print()
@@ -1811,19 +1825,20 @@ def create_jail(**create_options):
     print(DISCLAIMER)
 
     if SCRIPT_DIR_PATH.name != 'jailmaker':
-        eprint(dedent(
+        dprint(
             f"""
             {SCRIPT_NAME} needs to create files.
             Currently it can not decide if it is safe to create files in:
             {SCRIPT_DIR_PATH}
             Please create a dedicated dataset called "jailmaker", store {SCRIPT_NAME} there and try again.
-            """
-        ))
+            """,
+            True
+        )
 
         return 1
 
     if not get_mount_point(SCRIPT_DIR_PATH).is_relative_to('/mnt'):
-        print(dedent(
+        dprint(
             f"""
             {YELLOW}{BOLD}WARNING: BEWARE OF DATA LOSS{NORMAL}
 
@@ -1832,7 +1847,7 @@ def create_jail(**create_options):
             Jails will be stored under:
             {SCRIPT_DIR_PATH}
             """
-        ))
+        )
 
     jail_name, config, is_start_now = get_create_data(create_options)
 
@@ -1911,7 +1926,7 @@ def create_jail(**create_options):
         os_id = get_jail_os_info(jail_name).get('ID')
 
         if system_name != 'systemd' and os_id and os_id != 'nixos':
-            print(dedent(
+            dprint(
                 f"""
                 {YELLOW}{BOLD}WARNING: DISTRO NOT SUPPORTED{NORMAL}
 
@@ -1928,7 +1943,7 @@ def create_jail(**create_options):
 
                 {BOLD}Using this distro with {SCRIPT_NAME} is NOT recommended.{NORMAL}
                 """
-            ))
+            )
 
             print('Autostart has been disabled.')
             print('You need to start this jail manually.')
