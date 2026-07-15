@@ -37,12 +37,18 @@ from pathlib import Path
 from textwrap import dedent
 
 DEFAULT_CONFIG = """startup=0
+
+# Set a custom internal hostname inside the jail or leave empty to 
+# automatically use the jail's name for the hostname
+hostname=
+
+# Enable or disable Secure Computing Mode (seccomp); disabling seccomp 
+# filtering improves performance but at the expense of security
+seccomp=1
+
+# Intel and NVIDIA GPU passthrough settings
 gpu_passthrough_intel=0
 gpu_passthrough_nvidia=0
-
-# Turning off seccomp filtering improves performance at the expense of
-# security
-seccomp=1
 
 # Below you may add additional systemd-nspawn flags behind
 # systemd_nspawn_user_args=
@@ -915,6 +921,12 @@ def passthrough_nvidia(is_gpu_passthrough_nvidia, systemd_nspawn_extra_args, jai
 
         # Run ldconfig inside systemd-nspawn jail with the NVIDIA mounts
         # to ensure that the libraries get linked dynamically
+        #
+        # NOTE: The following can only be executed while the jail is NOT
+        # running, which is why exec_jail() cannot be used here. An
+        # assumption is being made that the jail is down and will be
+        # brought up automatically/manually downstream. This is why
+        # "systemd-nspawn" is being used instead of "systemd-run".
         try:
             systemd_nspawn = [
                 'systemd-nspawn',
@@ -1662,7 +1674,7 @@ def non_interactive_create(jail_name, create_options):
     config = KeyValueParser()
 
     if jail_config_path:
-        # TODO: fallback to default values for e.g. distro and release if they are not in the config file
+# TODO: fallback to default values for e.g. distro and release if they are not in the config file
         if jail_config_path == '-':
             print(f'Creating jail {jail_name} from config template passed via stdin.')
             config.read_string(sys.stdin.read())
@@ -1682,6 +1694,7 @@ def non_interactive_create(jail_name, create_options):
         'distro',
         'gpu_passthrough_intel',
         'gpu_passthrough_nvidia',
+        'hostname',
         'release',
         'seccomp',
         'startup',
@@ -1697,7 +1710,7 @@ def non_interactive_create(jail_name, create_options):
             # String, non-empty list of args or int
             and (isinstance(value, int) or len(value))
         ):
-            # TODO: this will wipe all systemd_nspawn_user_args from the template... Should there be an option to append them instead?
+# TODO: this will wipe all systemd_nspawn_user_args from the template... Should there be an option to append them instead?
             print(f'Overriding {option} config value with {value}.')
 
             config.my_set(option, value)
@@ -1938,6 +1951,7 @@ def create_jail(**create_options):
         return 1
 
     jail_path = get_jail_path(jail_name)
+    hostname = config.my_get('hostname') or jail_name
     distro = config.my_get('distro')
     release = config.my_get('release')
 
@@ -2121,12 +2135,29 @@ def create_jail(**create_options):
 
             print('enable systemd-networkd.service', file=preset_file.open('w'))
 
+# TODO: Look into cloud-init to see if it can be used to help initialize
+#  the jail, especially all the network settings in this section... but
+#  note that not all distros support it
+            # Update the internal hostname with a custom value, then
+            # prepend the internal hostname to the top of the hosts file
+            # to preserve the hostname named after the jail
+            if hostname != jail_name:
+                hostname_file = jail_rootfs_path / 'etc/hostname'
+                print(hostname, file=hostname_file.open('w'))
+
+                hosts_file = jail_rootfs_path / 'etc/hosts'
+                if hosts_file.exists():
+                    hosts = hosts_file.read_text()
+                    hosts = f'127.0.1.1       {hostname}\n' + hosts
+
+                    print(hosts, file=hosts_file.open('w'))
+
         with jail_config_path.open('w') as fp:
             config.write(fp)
 
         jail_config_path.chmod(0o600)
     except BaseException as error:
-        # Clean up on any exception and rethrow
+        # Clean up on any exceptions and rethrow
         cleanup(jail_path)
         raise error
 
@@ -2207,9 +2238,15 @@ def remove_jail(jail_name):
     dataset = get_zfs_dataset(get_jail_path(jail_name))
 
     if dataset:
-        print(f'\n{RED}DANGER: THE {UNDERLINE}"{dataset}"{NORMAL}{RED} DATASET IS GOING TO BE DELETED ALONG WITH ALL ZFS SNAPSHOTS.{NORMAL}')
+        dprint(
+            f"""
+            {RED}DANGER: THE {BOLD}"{dataset}"{NORMAL}{RED} DATASET IS 
+            GOING TO BE DELETED ALONG WITH ALL ZFS SNAPSHOTS. BACK UP 
+            YOUR DATA BEFORE CONTINUING; PRESS CTRL+C TO ABORT!{NORMAL}
+            """
+        )
 
-    check = input(f'\n{YELLOW}CAUTION: Type "{jail_name}" to confirm jail deletion!\n\n{NORMAL}')
+    check = input(f'\n{YELLOW}FINAL WARNING: Type "{jail_name}" to confirm jail deletion.\n\n{NORMAL}')
 
     if check != jail_name:
         eprint('Wrong name, nothing happened.')
