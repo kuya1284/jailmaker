@@ -151,6 +151,7 @@ VERSION_GOLDEYE = '25.10'
 is_tty = sys.stdout.isatty()
 BOLD = '\033[1m' if is_tty else ''
 RED = '\033[91m' if is_tty else ''
+GREEN = '\033[92m' if is_tty else ''
 YELLOW = '\033[93m' if is_tty else ''
 UNDERLINE = '\033[4m' if is_tty else ''
 NORMAL = '\033[0m' if is_tty else ''
@@ -267,8 +268,10 @@ class KeyValueParser(configparser.ConfigParser):
 
         fp.write(''.join(lines).rstrip())
 
-    # Set value for specified option key
     def my_set(self, option, value):
+        """
+        Sets value for specified option key
+        """
         if isinstance(value, bool):
             value = str(int(value))
         elif isinstance(value, list):
@@ -278,12 +281,16 @@ class KeyValueParser(configparser.ConfigParser):
 
         super().set(self._section_name, option, value)
 
-    # Return value for specified option key
     def my_get(self, option, fallback=_UNSET):
+        """
+        Returns the value for specified option key
+        """
         return super().get(self._section_name, option, fallback=fallback)
 
-    # Return value converted to boolean for specified option key
     def my_getboolean(self, option, fallback=_UNSET):
+        """
+        Returns the value type-casted to boolean for specified option key
+        """
         return super().getboolean(self._section_name, option, fallback=fallback)
 
 
@@ -1396,7 +1403,7 @@ def input_with_default(prompt, default):
     readline.set_startup_hook(lambda: readline.insert_text(default))
 
     try:
-        return input(prompt)
+        return input(f'{GREEN}{prompt}{NORMAL}')
     finally:
         readline.set_startup_hook()
 
@@ -1499,7 +1506,7 @@ def agree(question, default=None):
     hint = '[y/N]' if default == 'n' else hint
 
     while True:
-        user_input = input(f'{question} {hint} ') or default
+        user_input = input(f'{GREEN}{question} {hint}{NORMAL} ') or default
 
         if user_input.lower() in ['y', 'n']:
             return user_input.lower() == 'y'
@@ -1595,9 +1602,9 @@ def remove_zfs_dataset(absolute_path):
     subprocess.run(['zfs', 'destroy', '-r', dataset_to_remove], check=True)
 
 
-def check_jail_name_valid(name):
+def is_valid_jail_name_or_hostname(name):
     """
-    Confirms that the jail name matches the required format.
+    Confirms that the jail name or hostname matches the required format.
     """
     if re.match(r'^[.a-zA-Z0-9-]{1,64}$', name) and not name.startswith('.') and '..' not in name:
         return True
@@ -1618,7 +1625,7 @@ def check_jail_name_valid(name):
     return False
 
 
-def check_jail_name_available(name, warn=True):
+def is_jail_name_available(name, warn=True):
     """
     Confirms if a jail name is available for use.
     """
@@ -1627,7 +1634,7 @@ def check_jail_name_available(name, warn=True):
 
     if warn:
         print()
-        eprint(f'A jail with this name, "{name}", already exists.')
+        eprint(f'{RED}A jail with this name, "{name}", already exists.{NORMAL}')
 
     return False
 
@@ -1637,10 +1644,26 @@ def ask_jail_name(name=''):
         print()
         name = input_with_default('Enter jail name: ', name).strip()
 
-        if not (check_jail_name_valid(name) and check_jail_name_available(name)):
+        if not (is_valid_jail_name_or_hostname(name) and is_jail_name_available(name)):
             continue
 
         return name
+
+
+def ask_custom_hostname(hostname=None):
+    while True:
+        print()
+
+        prompt = 'Enter hostname for jail (press ENTER or leave blank to use jail name): '
+        hostname = input_with_default(prompt, hostname).strip()
+
+        if not hostname:
+            return ''
+
+        if not is_valid_jail_name_or_hostname(hostname):
+            continue
+
+        return hostname
 
 
 def agree_with_default(config, key, question):
@@ -1661,34 +1684,71 @@ def get_text_editor():
     )
 
 
-def non_interactive_create(jail_name, create_options):
-    if not check_jail_name_valid(jail_name):
-        return None, None
+def init_config_from_template(config, config_path, is_interactive):
+    """
+    Reads the config options from either STDIN, from a config template
+    stored in a file, or from an interactive session with a text editor.
+    The options read will replace the default options.
+    """
+    if config_path:
+        # Read and initialize from STDIN
+        if config_path == '-':
+            print('Reading options from config template entered via STDIN.')
+            print(f'{GREEN}Enter the config options on a new line, then press Ctrl + D when done.{NORMAL}')
 
-    if not check_jail_name_available(jail_name):
-        return None, None
-
-    is_start_now = create_options.pop('start', False)
-    jail_config_path = create_options.pop('config')
-
-    config = KeyValueParser()
-
-    if jail_config_path:
-# TODO: fallback to default values for e.g. distro and release if they are not in the config file
-        if jail_config_path == '-':
-            print(f'Creating jail {jail_name} from config template passed via stdin.')
             config.read_string(sys.stdin.read())
-        else:
-            print(f'Creating jail {jail_name} from config template {jail_config_path}.')
 
-            if jail_config_path not in config.read(jail_config_path):
-                eprint(f'Failed to read config template {jail_config_path}.')
-                return None, None
-    else:
-        print(f'Creating jail {jail_name} with default config.')
-        config.read_string(DEFAULT_CONFIG)
+            print('Options read from STDIN successful.')
+            return
 
+        # Read and initialize from file
+        print(f'Reading options from config template: {config_path}.')
+        if config_path not in config.read(config_path):
+            fail(f'Failed to read config template {config_path}. Exiting!')
+
+        print('Options read from file successful.')
+        return
+
+    if not (is_interactive and agree('Do you wish to create a jail from a config template?', 'n')):
+        print('No config template to read from... continuing...')
+        return
+
+    # Read and initialize from interactive text editor
+    print('Reading options from config template entered via interactive text editor.')
+
+    dprint(
+        """
+        A text editor will open so you can provide the config template.
+
+        1. Please copy your config
+        2. Paste it into the text editor
+        3. Save and close the text editor
+        """
+    )
+
+    input(f'{GREEN}Press Enter to open the text editor.{NORMAL}')
+
+    with tempfile.NamedTemporaryFile(mode='w+t') as f:
+        subprocess.call([get_text_editor(), f.name])
+        f.seek(0)
+        config.read_file(f)
+        print('Options read from text editor successful.')
+
+
+def init_config_from_cli(config, create_options):
+    """
+    Reads the config options from the CLI arguments. The values read
+    will replace the default options.
+    """
     is_user_override = False
+    is_start_now = create_options.get('start')
+    is_cli_distro = create_options.get('distro') is not None
+    is_cli_release = create_options.get('release') is not None
+
+    if is_cli_distro and not is_cli_release:
+        fail('You must specify the --release when using --distro.')
+    if is_cli_release and not is_cli_distro:
+        fail('You must specify the --distro when using --release.')
 
     options = [
         'distro',
@@ -1702,14 +1762,10 @@ def non_interactive_create(jail_name, create_options):
     ]
 
     for option in options:
-        value = create_options.pop(option)
+        value = create_options.get(option)
 
-        if (value is not None
-            and value is not config.my_get(option, None)
-
-            # String, non-empty list of args or int
-            and (isinstance(value, int) or len(value))
-        ):
+        # String, non-empty list of args or int
+        if value is not None and (isinstance(value, int) or len(value)):
 # TODO: this will wipe all systemd_nspawn_user_args from the template... Should there be an option to append them instead?
             print(f'Overriding {option} config value with {value}.')
 
@@ -1719,182 +1775,195 @@ def non_interactive_create(jail_name, create_options):
     if not is_user_override:
         dprint(
             f"""
-            HINT: run `{SCRIPT_NAME} create` without any arguments for interactive config.
-            Or use CLI args to override the default options.
+            HINT: Run `{SCRIPT_NAME} create` without jail_name for an interactive 
+            config; or use CLI args to override the default and/or template 
+            options. 
+            
             For more info, run: `{SCRIPT_NAME} create --help`
             """
         )
 
-    return config, is_start_now
+    return is_start_now
 
 
-def interactive_create():
-    config = KeyValueParser()
-    config.read_string(DEFAULT_CONFIG)
-
-    recommended_distro = config.my_get('distro')
-    recommended_release = config.my_get('release')
-
+def init_config_from_user_input(config, create_options, jail_name, is_interactive, is_start_now):
     """
-    Config handling
+    Reads the config options from user inputs. The values read will
+    replace the default options.
     """
-    jail_name = ''
+    if not is_interactive:
+        return
 
     print()
 
-    if agree('Do you wish to create a jail from a config template?', 'n'):
-        dprint(
-            """
-            A text editor will open so you can provide the config template.
+    # Set the hostname only if it wasn't already set via CLI or a config
+    # template, falling back to the jail name when necessary
+    if not config.my_get('hostname'):
+        config.my_set('hostname', ask_custom_hostname(jail_name) or jail_name)
 
-            1. Please copy your config
-            2. Paste it into the text editor
-            3. Save and close the text editor
+    is_cli_distro = create_options.get('distro') is not None
+    is_cli_release = create_options.get('release') is not None
+    is_cli_gpu_passthrough_intel = create_options.get('gpu_passthrough_intel') is not None
+    is_cli_gpu_passthrough_nvidia = create_options.get('gpu_passthrough_nvidia') is not None
+    is_cli_startup = create_options.get('startup') is not None
+    config_distro = config.my_get('distro')
+    config_release = config.my_get('release')
+
+    if (not is_cli_distro
+        and not is_cli_release
+        and not agree(f'Install the recommended image ({config_distro} {config_release})?', 'y')
+    ):
+        dprint(
+            f"""
+            {YELLOW}{BOLD}WARNING: ADVANCED USAGE{NORMAL}
+
+            You may now choose from a list which distro to install.
+            But not all of them may work with {SCRIPT_NAME} since these images are made for LXC.
+            Distros based on systemd probably work (e.g. Ubuntu, Arch Linux and Rocky Linux).
             """
         )
 
-        input('Press Enter to open the text editor.')
+        input(f'{GREEN}Press Enter to continue...{NORMAL}')
+        print()
 
-        with tempfile.NamedTemporaryFile(mode='w+t') as f:
-            subprocess.call([get_text_editor(), f.name])
-            f.seek(0)
+        if run_lxc_download_script() != 0:
+            fail('Failed to list images. Aborting...')
 
-            # Start over with a new KeyValueParser to parse user config
-            config = KeyValueParser()
-            config.read_file(f)
+        print()
+        print('Choose from the DIST column.')
+        print()
+        config.my_set('distro', input(f'{GREEN}Distro:{NORMAL} '))
 
-        # Ask for jail name
-        jail_name = ask_jail_name(jail_name)
+        print()
+        print('Choose from the RELEASE column (or ARCH if RELEASE is empty).')
+        print()
+        config.my_set('release', input(f'{GREEN}Release:{NORMAL} '))
+        print()
+
+    if not is_cli_gpu_passthrough_intel and not config.my_getboolean('gpu_passthrough_intel'):
+        agree_with_default(config, 'gpu_passthrough_intel', 'Passthrough the Intel GPU (if present)?')
+        print()
+
+    if not is_cli_gpu_passthrough_nvidia and not config.my_getboolean('gpu_passthrough_nvidia'):
+        agree_with_default(config, 'gpu_passthrough_nvidia', 'Passthrough the NVIDIA GPU (if present)?')
+        print()
+
+    if not config.my_getboolean('seccomp'):
+        prompt = f'Your current config will disable Secure Computing Mode (seccomp). Would you like to enable it instead?'
+        config.my_set('seccomp', agree(prompt, 'n'))
+        print()
+
+    dprint(
+        f"""
+        {YELLOW}{BOLD}WARNING: CHECK SYNTAX{NORMAL}
+
+        You may pass additional flags to systemd-nspawn.
+        With incorrect flags the jail may not start.
+        It is possible to correct/add/remove flags post-install.
+        """
+    )
+
+    if agree('Show the man page for systemd-nspawn?', 'n'):
+        subprocess.run(['man', 'systemd-nspawn'])
     else:
-        print()
-
-        question = f'Install the recommended image ({recommended_distro} {recommended_release})?'
-
-        if not agree(question, 'y'):
-            dprint(
-                f"""
-                {YELLOW}{BOLD}WARNING: ADVANCED USAGE{NORMAL}
-
-                You may now choose from a list which distro to install.
-                But not all of them may work with {SCRIPT_NAME} since these images are made for LXC.
-                Distros based on systemd probably work (e.g. Ubuntu, Arch Linux and Rocky Linux).
-                """
-            )
-
-            input('Press Enter to continue...')
-            print()
-
-            if run_lxc_download_script() != 0:
-                fail('Failed to list images. Aborting...')
-
-            print()
-            print('Choose from the DIST column.')
-            print()
-            config.my_set('distro', input('Distro: '))
-
-            print()
-            print('Choose from the RELEASE column (or ARCH if RELEASE is empty).')
-            print()
-            config.my_set('release', input('Release: '))
-
-        jail_name = ask_jail_name(jail_name)
-
-        print()
-        agree_with_default(
-            config,
-            'gpu_passthrough_intel',
-            'Passthrough the intel GPU (if present)?'
-        )
-
-        print()
-        agree_with_default(
-            config,
-            'gpu_passthrough_nvidia',
-            'Passthrough the nvidia GPU (if present)?'
-        )
+        try:
+            base_os = platform.freedesktop_os_release().get('VERSION_CODENAME', config_release)
+        except AttributeError:
+            base_os = config_release
 
         dprint(
             f"""
-            {YELLOW}{BOLD}WARNING: CHECK SYNTAX{NORMAL}
-
-            You may pass additional flags to systemd-nspawn.
-            With incorrect flags the jail may not start.
-            It is possible to correct/add/remove flags post-install.
+            You may read the systemd-nspawn manual online:
+            https://manpages.debian.org/{base_os}/systemd-container/systemd-nspawn.1.en.html
             """
         )
 
-        if agree('Show the man page for systemd-nspawn?', 'n'):
-            subprocess.run(['man', 'systemd-nspawn'])
-        else:
-            try:
-                base_os_version = platform.freedesktop_os_release().get(
-                    'VERSION_CODENAME',
-                    recommended_release
-                )
-            except AttributeError:
-                base_os_version = recommended_release
+    # Backslashes and colons need to be escaped in bind mount
+    # options. For example, to bind mount a file called:
+    #
+    # weird chars :?\"
+    #
+    # the corresponding command would be:
+    #
+    # --bind-ro='/mnt/data/weird chars \:?\\"'
+    dprint(
+        """
+        Would you like to add additional systemd-nspawn flags? 
+        (If you have nothing to add, press ENTER to continue.)
+        
+        For example to mount directories inside the jail you may:
+        
+        Mount the TrueNAS location /mnt/pool/dataset to the /home directory of the jail with:
+        --bind='/mnt/pool/dataset:/home'
+        
+        Or the same, but readonly, with:
+        --bind-ro='/mnt/pool/dataset:/home'
+        
+        Or create macvlan interface with:
+        --network-macvlan=eno1 --resolv-conf=bind-host
+        """
+    )
 
-            dprint(
-                f"""
-                You may read the systemd-nspawn manual online:
-                https://manpages.debian.org/{base_os_version}/systemd-container/systemd-nspawn.1.en.html
-                """
-            )
+    config.my_set(
+        'systemd_nspawn_user_args',
+        '\n    '.join(shlex.split(input(f'{GREEN}Additional Flags:{NORMAL} ') or '')),
+    )
 
-        # Backslashes and colons need to be escaped in bind mount
-        # options. For example, to bind mount a file called:
-        #
-        # weird chars :?\"
-        #
-        # the corresponding command would be:
-        #
-        # --bind-ro='/mnt/data/weird chars \:?\\"'
-        dprint(
-            """
-            Would you like to add additional systemd-nspawn flags?
-            
-            For example to mount directories inside the jail you may:
-            
-            Mount the TrueNAS location /mnt/pool/dataset to the /home directory of the jail with:
-            --bind='/mnt/pool/dataset:/home'
-            
-            Or the same, but readonly, with:
-            --bind-ro='/mnt/pool/dataset:/home'
-            
-            Or create macvlan interface with:
-            --network-macvlan=eno1 --resolv-conf=bind-host
-            """
-        )
+    dprint(
+        f"""
+        The `{SCRIPT_NAME} startup` command can automatically start a 
+        selection of jails. This comes in handy when you want to 
+        automatically start multiple jails after booting TrueNAS CE 
+        (e.g. from a Post Init Script).
+        """
+    )
 
-        config.my_set(
-            'systemd_nspawn_user_args',
-            '\n    '.join(shlex.split(input('Additional flags: ') or '')),
-        )
+    if not is_cli_startup and not config.my_getboolean('startup'):
+        prompt = f'Do you want to start this jail with the following startup command?: {SCRIPT_NAME} startup?'
+        config.my_set('startup', agree(prompt, 'n'))
+        print()
 
-        dprint(
-            f"""
-            The `{SCRIPT_NAME} startup` command can automatically start a selection of jails.
-            This comes in handy when you want to automatically start multiple jails after booting TrueNAS CE (e.g. from a Post Init Script).
-            """
-        )
+    if not is_start_now:
+        prompt = 'Do you want to start this jail IMMEDIATELY after creating the jail?'
+        is_start_now = agree(prompt, 'y')
+        print()
 
-        question = f'Do you want to start this jail when running: {SCRIPT_NAME} startup?'
-        config.my_set('startup', agree(question, 'n'))
-
-    print()
-    is_start_now = agree('Do you want to start this jail now (when create is done)?', 'y')
-    print()
-
-    return jail_name, config, is_start_now
+    return is_start_now
 
 
 def get_create_data(create_options):
-    jail_name = create_options.pop('jail_name', None)
+    """
+    Returns the data needed to create the jail. The data will be
+    processed and initialized in the order that follows, with the latter
+    options replacing the previous options, essentially giving the
+    latter higher precedence. Options will be read from the following:
 
-    if not jail_name:
-        return interactive_create()
+    1. Default config (DEFAULT_CONFIG)
+    2. Config template (-c or --config or interactive or STDIN)
+    3. CLI arguments (--seccomp, --startup, etc.)
+    4. Interactive inputs (when jail_name is omitted)
+    """
+    config = KeyValueParser()
+    config.read_string(DEFAULT_CONFIG)
 
-    config, is_start_now = non_interactive_create(jail_name, create_options)
+    config_path = create_options.get('config')
+
+    jail_name = create_options.get('jail_name')
+    is_interactive = not jail_name
+    jail_name = ask_jail_name(jail_name) if is_interactive else jail_name
+
+    if not (is_valid_jail_name_or_hostname(jail_name) and is_jail_name_available(jail_name)):
+        return None, None
+
+    init_config_from_template(config, config_path, is_interactive)
+    is_start_now = init_config_from_cli(config, create_options)
+    is_start_now = init_config_from_user_input(
+        config,
+        create_options,
+        jail_name,
+        is_interactive,
+        is_start_now
+    )
 
     return jail_name, config, is_start_now
 
@@ -1947,11 +2016,11 @@ def create_jail(**create_options):
 
     jail_name, config, is_start_now = get_create_data(create_options)
 
-    if config is None:
+    if jail_name is None:
         return 1
 
     jail_path = get_jail_path(jail_name)
-    hostname = config.my_get('hostname') or jail_name
+    hostname = config.my_get('hostname')
     distro = config.my_get('distro')
     release = config.my_get('release')
 
@@ -2177,10 +2246,10 @@ def edit_jail(jail_name):
     """
     Edit jail with given name.
     """
-    if not check_jail_name_valid(jail_name):
+    if not is_valid_jail_name_or_hostname(jail_name):
         return 1
 
-    if check_jail_name_available(jail_name, False):
+    if is_jail_name_available(jail_name, False):
         eprint(f'A jail with name {jail_name} does not exist.')
         return 1
 
@@ -2228,10 +2297,10 @@ def remove_jail(jail_name):
     """
     Remove jail with given name.
     """
-    if not check_jail_name_valid(jail_name):
+    if not is_valid_jail_name_or_hostname(jail_name):
         return 1
 
-    if check_jail_name_available(jail_name, False):
+    if is_jail_name_available(jail_name, False):
         eprint(f'A jail with name {jail_name} does not exist.')
         return 1
 
@@ -2487,8 +2556,12 @@ def init_commands(parser):
                     'choices': [0, 1],
                 },
                 {
+                    'name_or_flags': '--hostname',
+                    'help': "Custom internal Hostname; omitting will default to using the jail's name",
+                },
+                {
                     'name_or_flags': '--seccomp',
-                    'help': 'Turn off seccomp filtering to improve performance at the expense of security',
+                    'help': 'Toggle Secure Computing Mode (seccomp); disabling seccomp filtering improves performance at the expense of security',
                     'type': int,
                     'choices': [0, 1],
                 },
@@ -2567,7 +2640,6 @@ def init_commands(parser):
                 {
                     'name_or_flags': '--action',
                     'help': 'Start jail after create',
-                    'type': str,
                     'choices': ['install', 'uninstall'],
                     'required': True,
                 },
