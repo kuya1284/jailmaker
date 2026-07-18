@@ -1758,7 +1758,6 @@ def init_config_from_cli(config, create_options):
         'release',
         'seccomp',
         'startup',
-        'systemd_nspawn_user_args',
     ]
 
     for option in options:
@@ -1766,11 +1765,23 @@ def init_config_from_cli(config, create_options):
 
         # String, non-empty list of args or int
         if value is not None and (isinstance(value, int) or len(value)):
-# TODO: this will wipe all systemd_nspawn_user_args from the template... Should there be an option to append them instead?
             print(f'Overriding {option} config value with {value}.')
 
             config.my_set(option, value)
             is_user_override = True
+
+    cli_systemd_nspawn_user_args = create_options.get('systemd_nspawn_user_args')
+
+    if cli_systemd_nspawn_user_args:
+        print(f'Appending additional systemd-nspawn flags from CLI to config template.')
+
+        cli_systemd_nspawn_user_args = '\n'.join(cli_systemd_nspawn_user_args)
+
+        systemd_nspawn_user_args = config.my_get('systemd_nspawn_user_args')
+        systemd_nspawn_user_args = systemd_nspawn_user_args + '\n' + cli_systemd_nspawn_user_args
+
+        config.my_set('systemd_nspawn_user_args', systemd_nspawn_user_args)
+        is_user_override = True
 
     if not is_user_override:
         dprint(
@@ -1888,8 +1899,10 @@ def init_config_from_user_input(config, create_options, jail_name, is_interactiv
     # --bind-ro='/mnt/data/weird chars \:?\\"'
     dprint(
         """
-        Would you like to add additional systemd-nspawn flags? 
-        (If you have nothing to add, press ENTER to continue.)
+        Would you like to add additional systemd-nspawn flags?
+          - If you have something to add, enter one or more flags separated by spaces
+          - If you have nothing to add, press ENTER to continue
+          - Additional flags will be appended to systemd_nspawn_user_args defined in a config template
         
         For example to mount directories inside the jail you may:
         
@@ -1904,10 +1917,17 @@ def init_config_from_user_input(config, create_options, jail_name, is_interactiv
         """
     )
 
-    config.my_set(
-        'systemd_nspawn_user_args',
-        '\n    '.join(shlex.split(input(f'{GREEN}Additional Flags:{NORMAL} ') or '')),
-    )
+    additional_user_args = shlex.split(input(f'{GREEN}Additional Flags:{NORMAL} ') or '')
+
+    if additional_user_args:
+        print(f'Appending additional systemd-nspawn flags from user input to config template.')
+
+        additional_user_args = '\n'.join(additional_user_args)
+
+        systemd_nspawn_user_args = config.my_get('systemd_nspawn_user_args')
+        systemd_nspawn_user_args = systemd_nspawn_user_args + '\n' + additional_user_args
+
+        config.my_set('systemd_nspawn_user_args', systemd_nspawn_user_args)
 
     dprint(
         f"""
@@ -2583,7 +2603,7 @@ def init_commands(parser):
                 },
                 {
                     'name_or_flags': 'systemd_nspawn_user_args',
-                    'help': 'Additional systemd-nspawn flags',
+                    'help': 'Additional systemd-nspawn flags (Will be merged with systemd_nspawn_user_args in config template)',
                     'nargs': '*',
                 },
             ],
