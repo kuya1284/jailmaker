@@ -5,7 +5,7 @@ Create persistent Linux 'jails' on TrueNAS CE, with full access to \
 all files via bind mounts, thanks to systemd-nspawn!
 """
 
-__version__ = '2.3.1'
+__version__ = '2.3.0'
 __author__ = 'Jip-Hop'
 __copyright__ = 'Copyright (C) 2023, Jip-Hop'
 __license__ = 'LGPL-3.0-only'
