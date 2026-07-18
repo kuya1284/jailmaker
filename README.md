@@ -107,32 +107,51 @@ Creating a jail with the default settings is as simple as:
 ./jlmkr.py create --start myjail
 ```
 
+By default, the hostname in the jail will default to the jail name; however, you may set a custom internal hostname.
+
+```shell
+./jlmkr.py create --start --hostname myhostname myjail
+```
+
 You may also specify a path to a config template, for a quick and consistent jail creation process.
 
 ```shell
 ./jlmkr.py create --start --config /path/to/config/template myjail
 ```
 
-Or you can override the default config by using flags. See `./jlmkr.py create --help` for the available options. 
-Anything passed after the jail name will be passed to `systemd-nspawn` when starting the jail. See the `systemd-nspawn` 
-manual for available options, specifically 
-[Mount Options](https://manpages.debian.org/bookworm/systemd-container/systemd-nspawn.1.en.html#Mount_Options) and 
-[Networking Options](https://manpages.debian.org/bookworm/systemd-container/systemd-nspawn.1.en.html#Networking_Options) 
-are frequently used.
+Or you can override the default config by using flags.
 
 ```shell
 ./jlmkr.py create --start --distro=ubuntu --release=jammy myjail --bind-ro=/mnt
 ```
 
-If you omit the jail name, the create process is interactive. You'll be presented with questions which guide you through 
-the process.
+Or you can override the options in the config template using flags as well. See `./jlmkr.py create --help` for the 
+available options. Anything passed after the jail name will be passed to `systemd-nspawn` when starting the jail. See 
+the `systemd-nspawn` manual for available options, specifically 
+[Mount Options](https://manpages.debian.org/bookworm/systemd-container/systemd-nspawn.1.en.html#Mount_Options) and 
+[Networking Options](https://manpages.debian.org/bookworm/systemd-container/systemd-nspawn.1.en.html#Networking_Options) 
+are frequently used.
+
+```shell
+./jlmkr.py create --start --config /path/to/config/template myjail --distro=ubuntu --release=jammy myjail --bind-ro=/mnt
+```
+
+If you omit the jail name, the interactive session will be used to configure the jail. You'll be presented with 
+questions which will guide you through the process.
 
 ```shell
 ./jlmkr.py create
 ```
 
-After answering some questions you should have created your first jail (and it should be running if you chose to start 
-it after creating)!
+After answering the questions, a new jail will be created and will start automatically if you answered "Yes" to the 
+question about starting the jail immediately.
+
+#### Overriding Options
+The priority of the options are handled in the following order when creating a jail, 
+1. Interactive inputs (HIGHEST, but only when jail name is omitted)
+2. CLI flags
+3. Config template
+4. Default config (LOWEST)
 
 ### Startup Jails on Boot
 

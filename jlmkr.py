@@ -1960,7 +1960,7 @@ def get_create_data(create_options):
 
     1. Default config (DEFAULT_CONFIG)
     2. Config template (-c or --config or interactive or STDIN)
-    3. CLI arguments (--seccomp, --startup, etc.)
+    3. CLI flags (--seccomp, --startup, etc.)
     4. Interactive inputs (when jail_name is omitted)
     """
     config = KeyValueParser()
