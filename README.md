@@ -122,7 +122,7 @@ You may also specify a path to a config template, for a quick and consistent jai
 Or you can override the default config by using flags.
 
 ```shell
-./jlmkr.py create --start --distro=ubuntu --release=jammy myjail --bind-ro=/mnt
+./jlmkr.py create --start --distro ubuntu --release jammy myjail --bind-ro='/mnt'
 ```
 
 Or you can override the options in the config template using flags as well. See `./jlmkr.py create --help` for the 
@@ -133,7 +133,7 @@ the `systemd-nspawn` manual for available options, specifically
 are frequently used.
 
 ```shell
-./jlmkr.py create --start --config /path/to/config/template myjail --distro=ubuntu --release=jammy myjail --bind-ro=/mnt
+./jlmkr.py create --start --config /path/to/config/template --distro ubuntu --release jammy myjail --bind-ro='/mnt'
 ```
 
 If you omit the jail name, the interactive session will be used to configure the jail. You'll be presented with 
