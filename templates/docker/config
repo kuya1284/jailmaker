@@ -1,8 +1,16 @@
 startup=0
+
+# Set a custom internal hostname inside the jail or leave empty to
+# automatically use the jail's name for the hostname
+hostname=
+
+# Enable or disable Secure Computing Mode (seccomp); disabling seccomp
+# filtering improves performance but at the expense of security
+seccomp=1
+
+# Intel and NVIDIA GPU passthrough settings
 gpu_passthrough_intel=0
 gpu_passthrough_nvidia=0
-# Turning off seccomp filtering improves performance at the expense of security
-seccomp=1
 
 # Use bridge networking to provide an isolated network namespace,
 # so docker can manage firewall rules
