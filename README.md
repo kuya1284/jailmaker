@@ -167,7 +167,10 @@ config file.
 If you need to support for **NVIDIA GPU Passthrough** on **TrueNAS CE Goldeye or newer**, use this command instead to 
 automatically start the **NVIDIA Persistence Mode**:
 
-`nvidia-persistenced && /mnt/mypool/jailmaker/jlmkr.py startup`
+```shell
+# Start NVIDIA GPU in persistence mode, then call startup using the absolute path to jlmkr.py
+nvidia-persistenced && /mnt/mypool/jailmaker/jlmkr.py startup
+````
 
 This will help avoid repetitively initializing the GPU whenever it's needed. This is useful for apps like 
 [Beszel](https://beszel.dev/). If you have no plans to run apps that need to constantly query the GPU, but only plan to 
