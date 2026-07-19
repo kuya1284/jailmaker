@@ -1147,6 +1147,51 @@ def add_hook(jail_path, systemd_run_extra_args, hook_command, hook_type):
     systemd_run_extra_args += [f'--property={hook_type}={systemd_escape_path(hook_file)}']
 
 
+# TODO: Look into cloud-init to see if it can be used to help initialize
+#  the jail, especially all the network settings in this section... but
+#  note that not all distros support it
+def set_hostname(jail_name, hostname, jail_rootfs_path):
+    """
+    Updates the internal hostname with a custom value, then prepend the
+    internal hostname to the top of the hosts file to preserve the
+    hostname named after the jail.
+    """
+    if hostname == jail_name:
+        # Nothing to do
+        return
+
+    hostname_file = jail_rootfs_path / 'etc/hostname'
+    current_hostname = hostname_file.read_text().strip()
+
+    if hostname == current_hostname:
+        # Nothing to do
+        return
+
+    print(hostname, file=hostname_file.open('w'))
+
+    hosts_file = jail_rootfs_path / 'etc/hosts'
+
+    if not hosts_file.exists():
+        return
+
+    hosts = hosts_file.read_text()
+    new_entry = f'127.0.1.1\t{hostname} '
+
+    # When creating a new jail, there won't be space after the hostname;
+    # the space gets added to the end just in case someone were to
+    # rename the hostname to something else contain a substring of the
+    # original (i.e. "my-jail-test" to "my-jail")
+    if jail_name in hosts:
+        hosts = hosts.replace(jail_name, f'{hostname} ')
+    elif current_hostname in hosts:
+        old_entry = f'127.0.1.1\t{current_hostname} '
+        hosts = hosts.replace(old_entry, new_entry)
+    else:
+        hosts = f'{new_entry}\n{hosts}'
+
+    print(hosts.strip(), file=hosts_file.open('w'))
+
+
 def start_jail(jail_name):
     """
     Starts jail with given name.
@@ -1165,6 +1210,7 @@ def start_jail(jail_name):
         eprint('Aborting...')
         return 1
 
+    hostname = config.my_get('hostname')
     is_seccomp = config.my_getboolean('seccomp')
     pre_start_hook = config.my_get('pre_start_hook')
     post_start_hook = config.my_get('post_start_hook')
@@ -1210,6 +1256,7 @@ def start_jail(jail_name):
     add_hook(jail_path, systemd_run_extra_args, post_start_hook, 'ExecStartPost')
     add_hook(jail_path, systemd_run_extra_args, post_stop_hook, 'ExecStopPost')
 
+    set_hostname(jail_name, hostname, jail_rootfs_path)
     passthrough_intel(is_gpu_passthrough_intel, systemd_nspawn_extra_args)
     passthrough_nvidia(is_gpu_passthrough_nvidia, systemd_nspawn_extra_args, jail_name)
 
@@ -1803,7 +1850,7 @@ def init_config_from_user_input(config, create_options, jail_name, is_interactiv
     replace the default options.
     """
     if not is_interactive:
-        return
+        return is_start_now
 
     print()
 
@@ -2224,22 +2271,7 @@ def create_jail(**create_options):
 
             print('enable systemd-networkd.service', file=preset_file.open('w'))
 
-# TODO: Look into cloud-init to see if it can be used to help initialize
-#  the jail, especially all the network settings in this section... but
-#  note that not all distros support it
-            # Update the internal hostname with a custom value, then
-            # prepend the internal hostname to the top of the hosts file
-            # to preserve the hostname named after the jail
-            if hostname != jail_name:
-                hostname_file = jail_rootfs_path / 'etc/hostname'
-                print(hostname, file=hostname_file.open('w'))
-
-                hosts_file = jail_rootfs_path / 'etc/hosts'
-                if hosts_file.exists():
-                    hosts = hosts_file.read_text()
-                    hosts = f'127.0.1.1       {hostname}\n' + hosts
-
-                    print(hosts, file=hosts_file.open('w'))
+        set_hostname(jail_name, hostname, jail_rootfs_path)
 
         with jail_config_path.open('w') as fp:
             config.write(fp)
